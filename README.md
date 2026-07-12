@@ -108,5 +108,10 @@ troubleshooting.
 
 ## License
 
-MIT — see [LICENSE](LICENSE). _(Add a LICENSE file, or change this line if you
-prefer a different license.)_
+Copyright 2026 Ain Mutaqorrobin.
+
+Licensed under the **Apache License, Version 2.0** — see [LICENSE](LICENSE) and
+[NOTICE](NOTICE). You may use, modify, and redistribute this software (including
+commercially), **provided you retain the copyright and NOTICE and state any
+changes you make**. The software is provided "as is", without warranty of any
+kind.
