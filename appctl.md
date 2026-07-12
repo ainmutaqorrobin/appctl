@@ -328,7 +328,9 @@ origin cert, or `TLS_MODE=none` (or `ENABLE_SSL=0`) for an HTTP-only block. Set
 [`FORCE_HTTPS=1`](#forcing-http--https-force_https) for a `:80`→`:443` redirect,
 and [`ROUTES=…`](#fronting-several-containers-under-one-domain-routes) to front
 extra path-based upstreams (e.g. `/api`) under the same domain. All of these are
-recorded per project and preserved across re-`add`.
+recorded per project and preserved across re-`add`. For per-domain upload limits
+or streaming, add
+[`MAX_BODY_SIZE`/`PROXY_EXTRA`](#per-app-upload-limits--proxy-tuning-max_body_size-proxy_extra).
 
 **Re-running is safe.** If the project already exists, `appctl` keeps its
 existing port and just regenerates the config (useful after changing
@@ -686,6 +688,34 @@ sudo FORCE_HTTPS=1 appctl add book-review.mutaqorrobin.online
 It only takes effect when the project actually has a cert (certbot/shared);
 it's ignored for `TLS_MODE=none`. Like routes, it's stored per project.
 
+## Per-app upload limits & proxy tuning (`MAX_BODY_SIZE`, `PROXY_EXTRA`)
+
+Most apps are happy with the shared proxy settings, but some need per-domain
+tuning — an object store, say, that accepts large uploads and must stream rather
+than buffer. Two per-project knobs cover that:
+
+- **`MAX_BODY_SIZE`** overrides `client_max_body_size` for **this project only**
+  (the global `CLIENT_MAX_BODY_SIZE`, default `50M`, applies to everyone else):
+  ```bash
+  sudo MAX_BODY_SIZE=500M appctl add s3.example.com 9000
+  ```
+- **`PROXY_EXTRA`** injects **arbitrary extra nginx directives** at the project's
+  `server` level — an escape hatch for things the shared snippet can't express
+  per-app. Semicolon-separate multiple directives:
+  ```bash
+  sudo MAX_BODY_SIZE=500M \
+       PROXY_EXTRA='proxy_request_buffering off; proxy_buffering off;' \
+       appctl add s3.example.com 9000
+  ```
+
+Both are recorded per project and preserved across re-`add` and `ws` toggles.
+Put the body limit in `MAX_BODY_SIZE`, **not** `PROXY_EXTRA` (appctl rejects
+`client_max_body_size` inside `PROXY_EXTRA` to avoid emitting it twice). The
+`body=`/`+extra` markers in `appctl list` show which projects carry overrides.
+
+> **Note:** `client_max_body_size` is emitted at each project's `server` level
+> (so it can be overridden per app), **not** in the shared `proxy.conf` snippet.
+
 ## TLS hardening (certbot options)
 
 When a `:443` block is written, appctl **includes the certbot hardening files if
@@ -754,8 +784,10 @@ Every default can be overridden with an environment variable. Defaults:
 | `ENABLE_WS`             | `1`                              | `1` = new projects upgrade to WebSocket; `0` = off  |
 | `FORCE_HTTPS`           | _(unset)_                        | `1` = per-project `:80`→`:443` 301 redirect         |
 | `ROUTES`                | _(unset)_                        | Per-project extra path upstreams (`path=upstream\|…`) |
+| `MAX_BODY_SIZE`         | _(unset)_                        | Per-project `client_max_body_size` override         |
+| `PROXY_EXTRA`           | _(unset)_                        | Per-project raw server-level nginx directives       |
+| `CLIENT_MAX_BODY_SIZE`  | `50M`                            | Global default body limit (per-app via `MAX_BODY_SIZE`) |
 | `PROXY_TIMEOUT`         | `300s`                           | `proxy_connect_timeout` + `proxy_read_timeout`      |
-| `CLIENT_MAX_BODY_SIZE`  | `50M`                            | `client_max_body_size` (max upload)                 |
 | `NGINX_TEST_CMD`        | `nginx -t`                       | Command to validate config                          |
 | `NGINX_RELOAD_CMD`      | `systemctl reload nginx`         | Command to reload nginx                             |
 

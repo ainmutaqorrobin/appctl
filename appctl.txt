@@ -111,9 +111,19 @@ set -euo pipefail
 #   ROUTES='/api/=http://127.0.0.1:4000/'
 #   ROUTES='/api/=http://127.0.0.1:4000/|/ws=http://127.0.0.1:5000'
 #
-# FORCE_HTTPS and ROUTES are intentionally NOT given defaults here: leaving them
-# unset lets `add` tell "user asked for this" from "not mentioned" so a re-add
-# preserves a project's stored redirect/routes instead of clobbering them.
+# ---- Per-app proxy overrides ------------------------------------------------
+# MAX_BODY_SIZE overrides client_max_body_size for THIS project only (the global
+# CLIENT_MAX_BODY_SIZE below is the default). PROXY_EXTRA injects arbitrary extra
+# nginx directives at the project's server level — for things the shared snippet
+# can't express per-app, e.g. disabling buffering for an object store. Both are
+# recorded per project. Semicolon-separate multiple PROXY_EXTRA directives.
+#   MAX_BODY_SIZE=500M
+#   PROXY_EXTRA='proxy_request_buffering off; proxy_buffering off;'
+#
+# FORCE_HTTPS, ROUTES, MAX_BODY_SIZE and PROXY_EXTRA are intentionally NOT given
+# defaults here: leaving them unset lets `add` tell "user asked for this" from
+# "not mentioned" so a re-add preserves a project's stored values instead of
+# clobbering them.
 
 # ---- WebSocket --------------------------------------------------------------
 # Whether NEW projects get the HTTP->WebSocket upgrade headers. Recorded per
@@ -147,6 +157,19 @@ ws_norm() { case "${1,,}" in on|1|yes|true) echo on ;; *) echo off ;; esac; }
 
 # on/off for a boolean-ish flag ("1"/"on"/"yes"/"true" -> on).
 onoff() { case "${1,,}" in 1|on|yes|true) echo on ;; *) echo off ;; esac; }
+
+# Trim leading/trailing whitespace.
+trim() { local s="$1"; s="${s#"${s%%[![:space:]]*}"}"; s="${s%"${s##*[![:space:]]}"}"; printf '%s' "$s"; }
+
+# Validate PROXY_EXTRA: registry-stored (no tabs/newlines), and steer body-size
+# through MAX_BODY_SIZE so we never emit a duplicate client_max_body_size.
+validate_proxy_extra() {
+    local spec="$1"
+    [[ -n "$spec" ]] || return 0
+    [[ "$spec" == *$'\t'* || "$spec" == *$'\n'* ]] && die "PROXY_EXTRA may not contain tab/newline characters"
+    [[ "$spec" == *client_max_body_size* ]] && die "set the body limit with MAX_BODY_SIZE, not PROXY_EXTRA"
+    return 0
+}
 
 # Validate a ROUTES spec ("path=upstream|path=upstream"). Each path must start
 # with "/" and each upstream with "http". Registry-stored, so also reject tabs.
@@ -202,7 +225,7 @@ bootstrap() {
              "$NGINX_SITES_AVAILABLE" "$NGINX_SITES_ENABLED" "$NGINX_SNIPPETS_DIR"
 
     [[ -f "$APP_REGISTRY" ]] || \
-        printf '# project\tdomain\thost_port\tcontainer_port\ttls_mode\twebsocket\tforce_https\troutes\n' > "$APP_REGISTRY"
+        printf '# project\tdomain\thost_port\tcontainer_port\ttls_mode\twebsocket\tforce_https\troutes\tmax_body\tproxy_extra\n' > "$APP_REGISTRY"
 
     # The snippets + map are fully owned by appctl, so we (re)generate them on
     # every run. That way changing PROXY_TIMEOUT / CLIENT_MAX_BODY_SIZE (or
@@ -219,8 +242,9 @@ proxy_set_header X-Forwarded-For    \$proxy_add_x_forwarded_for;
 proxy_set_header X-Forwarded-Proto  \$scheme;
 proxy_connect_timeout  ${PROXY_TIMEOUT};
 proxy_read_timeout     ${PROXY_TIMEOUT};
-client_max_body_size   ${CLIENT_MAX_BODY_SIZE};
 EOF
+# Note: client_max_body_size is emitted per-project at server level (so it can be
+# overridden per app via MAX_BODY_SIZE), not here in the shared snippet.
 
     # WebSocket upgrade headers, included ONLY by projects with websocket=on.
     # Kept separate from proxy.conf so a project can opt out of the upgrade.
@@ -249,8 +273,9 @@ EOF
 # ---- Registry access --------------------------------------------------------
 registry_rows() { grep -vE '^[[:space:]]*(#|$)' "$APP_REGISTRY" 2>/dev/null || true; }
 
-# echoes 7 tab-separated fields:
+# echoes 9 tab-separated fields:
 #   domain  host_port  container_port  tls_mode  websocket  force_https  routes
+#   max_body  proxy_extra
 # returns 1 if not found. Missing trailing columns (older, narrower rows) are
 # filled with sensible defaults so upgrades are seamless.
 lookup_project() {
@@ -259,8 +284,10 @@ lookup_project() {
             mode   = ($5=="" ? defmode : $5)
             ws     = ($6=="" ? "on"    : $6)
             fhttps = ($7=="" ? "off"   : $7)
-            routes = $8   # may be empty
-            print $2"\t"$3"\t"$4"\t"mode"\t"ws"\t"fhttps"\t"routes; f=1
+            routes = $8          # may be empty
+            mbody  = $9          # may be empty (-> global default)
+            pextra = $10         # may be empty
+            print $2"\t"$3"\t"$4"\t"mode"\t"ws"\t"fhttps"\t"routes"\t"mbody"\t"pextra; f=1
         } END{exit !f}'
 }
 
@@ -275,11 +302,12 @@ remove_registry_line() {
     rm -f "$tmp"
 }
 
-# Append a fully-formed registry row (all eight columns):
+# Append a fully-formed registry row (all ten columns):
 #   project domain host_port container_port tls_mode websocket force_https routes
+#   max_body proxy_extra
 write_registry_line() {
-    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
-        "$1" "$2" "$3" "$4" "$5" "$6" "$7" "$8" >> "$APP_REGISTRY"
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+        "$1" "$2" "$3" "$4" "$5" "$6" "$7" "$8" "$9" "${10}" >> "$APP_REGISTRY"
 }
 
 # ---- Port tiers -------------------------------------------------------------
@@ -383,9 +411,22 @@ next_free_port() {
 # SSL_DHPARAM_FILE) are included if they exist on disk.
 write_server_block() {
     local project="$1" domain="$2" host_port="$3" cert="$4" cert_key="$5" ws="$6"
-    local force_https="${7:-off}" routes="${8:-}"
+    local force_https="${7:-off}" routes="${8:-}" max_body="${9:-}" proxy_extra="${10:-}"
     local fname="${project}"   # file named exactly like the project/domain, no .conf
     local conf="${NGINX_SITES_AVAILABLE}/${fname}"
+
+    # Per-project server-level directives: body limit (override or global default)
+    # plus any raw PROXY_EXTRA directives (e.g. buffering off for an object store).
+    local server_directives="    client_max_body_size ${max_body:-$CLIENT_MAX_BODY_SIZE};"
+    if [[ -n "$proxy_extra" ]]; then
+        local oldifs2="$IFS"; IFS=';'; local d
+        for d in $proxy_extra; do
+            d="$(trim "$d")"
+            [[ -n "$d" ]] && server_directives+="
+    ${d};"
+        done
+        IFS="$oldifs2"
+    fi
 
     # WS include line appended inside each location when this project opted in.
     local ws_line=""
@@ -441,6 +482,8 @@ server {
 ${tls_listen}
     server_name ${domain};
 
+${server_directives}
+
 ${locations}
 }
 EOF
@@ -453,6 +496,8 @@ server {
 ${tls_listen}
     server_name ${domain};
 
+${server_directives}
+
 ${locations}
 }
 EOF
@@ -463,6 +508,8 @@ server {
     listen 80;
     listen [::]:80;
     server_name ${domain};
+
+${server_directives}
 
 ${locations}
 }
@@ -547,8 +594,8 @@ cmd_add() {
     bootstrap
     check_tls_assets "$tls_mode"
 
-    local host_port existing="" stored_cport="" stored_mode="" stored_ws="" stored_fhttps="" stored_routes=""
-    local force_https routes
+    local host_port existing="" stored_cport="" stored_mode="" stored_ws="" stored_fhttps="" stored_routes="" stored_mbody="" stored_pextra=""
+    local force_https routes max_body proxy_extra
     if existing="$(lookup_project "$project")"; then
         host_port="$(printf '%s' "$existing" | cut -f2)"
         stored_cport="$(printf '%s' "$existing" | cut -f3)"
@@ -556,25 +603,32 @@ cmd_add() {
         stored_ws="$(printf '%s' "$existing" | cut -f5)"
         stored_fhttps="$(printf '%s' "$existing" | cut -f6)"
         stored_routes="$(printf '%s' "$existing" | cut -f7)"
+        stored_mbody="$(printf '%s' "$existing" | cut -f8)"
+        stored_pextra="$(printf '%s' "$existing" | cut -f9)"
         # A re-add keeps the recorded container port (and its port/tier) unless a
-        # new one is given; likewise redirect/routes are kept unless the matching
-        # env var is explicitly set this run.
+        # new one is given; likewise redirect/routes/body/extra are kept unless the
+        # matching env var is explicitly set this run.
         (( explicit_port )) || container_port="${stored_cport:-$container_port}"
-        if [[ -n "${FORCE_HTTPS+x}" ]]; then force_https="$(onoff "$FORCE_HTTPS")"; else force_https="$stored_fhttps"; fi
-        if [[ -n "${ROUTES+x}" ]];      then routes="$ROUTES";                     else routes="$stored_routes"; fi
+        if [[ -n "${FORCE_HTTPS+x}" ]];   then force_https="$(onoff "$FORCE_HTTPS")"; else force_https="$stored_fhttps"; fi
+        if [[ -n "${ROUTES+x}" ]];        then routes="$ROUTES";                     else routes="$stored_routes"; fi
+        if [[ -n "${MAX_BODY_SIZE+x}" ]]; then max_body="$MAX_BODY_SIZE";            else max_body="$stored_mbody"; fi
+        if [[ -n "${PROXY_EXTRA+x}" ]];   then proxy_extra="$PROXY_EXTRA";           else proxy_extra="$stored_pextra"; fi
         info "Project '$project' already maps to host port ${host_port}; regenerating its config."
     else
         force_https="$(onoff "${FORCE_HTTPS:-0}")"
         routes="${ROUTES:-}"
+        max_body="${MAX_BODY_SIZE:-}"
+        proxy_extra="${PROXY_EXTRA:-}"
         # Choose (prompt / env / default) then allocate from that tier's band.
         local tier; tier="$(prompt_tier)"
         resolve_tier_range "$tier" \
             || die "unknown tier '$tier' (available: $(tier_names)); configure PORT_TIERS"
         host_port="$(next_free_port "$RANGE_START" "$RANGE_END" "$tier")" || exit 1
-        write_registry_line "$project" "$domain" "$host_port" "$container_port" "$tls_mode" "$ws" "$force_https" "$routes"
+        write_registry_line "$project" "$domain" "$host_port" "$container_port" "$tls_mode" "$ws" "$force_https" "$routes" "$max_body" "$proxy_extra"
         info "Allocated host port ${host_port} (tier '$tier') -> '$project'."
     fi
     validate_routes "$routes"
+    validate_proxy_extra "$proxy_extra"
 
     # Resolve cert paths for the chosen mode.
     local cert cert_key
@@ -585,14 +639,14 @@ cmd_add() {
     if [[ "$tls_mode" == "certbot" ]]; then
         # Phase 1: HTTP-only block so certbot's http-01 challenge can be served.
         # (No cert yet, so force_https is a no-op here — the challenge needs :80.)
-        write_server_block "$project" "$domain" "$host_port" "" "" "$ws" "off" "$routes" >/dev/null
+        write_server_block "$project" "$domain" "$host_port" "" "" "$ws" "off" "$routes" "$max_body" "$proxy_extra" >/dev/null
         test_reload_or_rollback _rollback_add
 
         # Phase 2: obtain the cert. On failure keep the working HTTP route.
         if [[ -f "$cert" ]] || obtain_certbot_cert "$domain"; then
             # Phase 3: rewrite with :443. On test failure fall back to HTTP-only.
-            write_server_block "$project" "$domain" "$host_port" "$cert" "$cert_key" "$ws" "$force_https" "$routes" >/dev/null
-            _rollback_https() { write_server_block "$project" "$domain" "$host_port" "" "" "$ws" "off" "$routes" >/dev/null; }
+            write_server_block "$project" "$domain" "$host_port" "$cert" "$cert_key" "$ws" "$force_https" "$routes" "$max_body" "$proxy_extra" >/dev/null
+            _rollback_https() { write_server_block "$project" "$domain" "$host_port" "" "" "$ws" "off" "$routes" "$max_body" "$proxy_extra" >/dev/null; }
             test_reload_or_rollback _rollback_https
         else
             err "certbot failed to obtain a cert for ${domain} — leaving the HTTP-only route up."
@@ -601,7 +655,7 @@ cmd_add() {
         fi
     else
         # shared / none: single-phase write with the resolved cert paths.
-        write_server_block "$project" "$domain" "$host_port" "$cert" "$cert_key" "$ws" "$force_https" "$routes" >/dev/null
+        write_server_block "$project" "$domain" "$host_port" "$cert" "$cert_key" "$ws" "$force_https" "$routes" "$max_body" "$proxy_extra" >/dev/null
         test_reload_or_rollback _rollback_add
     fi
 
@@ -609,13 +663,15 @@ cmd_add() {
     # successful test+reload, so a failure can never leave a dangling row.
     if [[ -n "$existing" ]] && \
        { [[ "$container_port" != "$stored_cport" ]] || [[ "$tls_mode" != "$stored_mode" ]] || \
-         [[ "$ws" != "$stored_ws" ]] || [[ "$force_https" != "$stored_fhttps" ]] || [[ "$routes" != "$stored_routes" ]]; }; then
+         [[ "$ws" != "$stored_ws" ]] || [[ "$force_https" != "$stored_fhttps" ]] || [[ "$routes" != "$stored_routes" ]] || \
+         [[ "$max_body" != "$stored_mbody" ]] || [[ "$proxy_extra" != "$stored_pextra" ]]; }; then
         remove_registry_line "$project"
-        write_registry_line "$project" "$domain" "$host_port" "$container_port" "$tls_mode" "$ws" "$force_https" "$routes"
+        write_registry_line "$project" "$domain" "$host_port" "$container_port" "$tls_mode" "$ws" "$force_https" "$routes" "$max_body" "$proxy_extra"
     fi
 
     local scheme; scheme="$( [[ -n "$cert" ]] && echo https || echo http )"
     local extras=""; [[ "$force_https" == "on" ]] && extras+=", force-https"; [[ -n "$routes" ]] && extras+=", +routes"
+    [[ -n "$max_body" ]] && extras+=", body=${max_body}"; [[ -n "$proxy_extra" ]] && extras+=", +extra"
     info "Reloaded nginx: ${scheme}://${domain} -> ${BIND_ADDR}:${host_port} (tls=${tls_mode}, ws=${ws}${extras})"
     print_compose_snippet "$project" "$host_port" "$container_port"
 }
@@ -648,11 +704,15 @@ cmd_list() {
     fi
     printf '%-24s %-30s %-10s %-15s %-10s %-8s %-4s %s\n' \
         "PROJECT" "DOMAIN" "HOST_PORT" "CONTAINER_PORT" "TIER" "TLS" "WS" "NOTES"
-    registry_rows | sort -t$'\t' -k3 -n | \
-        while IFS=$'\t' read -r project domain host_port cport mode ws fhttps routes; do
+    # Reformat tabs to \037 so `read` keeps empty middle fields (tab is IFS
+    # whitespace, which read would otherwise collapse).
+    registry_rows | sort -t$'\t' -k3 -n | awk 'BEGIN{FS="\t";OFS="\037"}{$1=$1;print}' | \
+        while IFS=$'\037' read -r project domain host_port cport mode ws fhttps routes mbody pextra; do
             local notes=""
             [[ "$fhttps" == "on" ]] && notes+="→https "
-            [[ -n "$routes" ]]      && notes+="+routes"
+            [[ -n "$routes" ]]      && notes+="+routes "
+            [[ -n "$mbody" ]]       && notes+="body=${mbody} "
+            [[ -n "$pextra" ]]      && notes+="+extra"
             printf '%-24s %-30s %-10s %-15s %-10s %-8s %-4s %s\n' \
                 "$project" "$domain" "$host_port" "$cport" \
                 "$(tier_for_port "$host_port")" "${mode:-$TLS_MODE}" "${ws:-on}" "$notes"
@@ -677,7 +737,7 @@ cmd_ws() {
     require_root
     bootstrap
 
-    local row domain host_port container_port tls_mode ws fhttps routes
+    local row domain host_port container_port tls_mode ws fhttps routes mbody pextra
     row="$(lookup_project "$project")" || die "project '$project' is not in the registry."
     domain="$(printf '%s' "$row" | cut -f1)"
     host_port="$(printf '%s' "$row" | cut -f2)"
@@ -686,6 +746,8 @@ cmd_ws() {
     ws="$(printf '%s' "$row" | cut -f5)"
     fhttps="$(printf '%s' "$row" | cut -f6)"
     routes="$(printf '%s' "$row" | cut -f7)"
+    mbody="$(printf '%s' "$row" | cut -f8)"
+    pextra="$(printf '%s' "$row" | cut -f9)"
 
     if [[ "$ws" == "$want" ]]; then
         info "WebSocket upgrade already '${want}' for '${project}'. Nothing to do."
@@ -698,13 +760,13 @@ cmd_ws() {
     # we don't emit a :443 block pointing at a missing file.
     [[ -n "$cert" && ! -f "$cert" ]] && { cert=""; cert_key=""; }
 
-    write_server_block "$project" "$domain" "$host_port" "$cert" "$cert_key" "$want" "$fhttps" "$routes" >/dev/null
+    write_server_block "$project" "$domain" "$host_port" "$cert" "$cert_key" "$want" "$fhttps" "$routes" "$mbody" "$pextra" >/dev/null
 
-    _rollback_ws() { write_server_block "$project" "$domain" "$host_port" "$cert" "$cert_key" "$ws" "$fhttps" "$routes" >/dev/null; }
+    _rollback_ws() { write_server_block "$project" "$domain" "$host_port" "$cert" "$cert_key" "$ws" "$fhttps" "$routes" "$mbody" "$pextra" >/dev/null; }
     test_reload_or_rollback _rollback_ws
 
     remove_registry_line "$project"
-    write_registry_line "$project" "$domain" "$host_port" "$container_port" "$tls_mode" "$want" "$fhttps" "$routes"
+    write_registry_line "$project" "$domain" "$host_port" "$container_port" "$tls_mode" "$want" "$fhttps" "$routes" "$mbody" "$pextra"
     info "WebSocket upgrade set to '${want}' for '${project}'. nginx reloaded."
 }
 
@@ -745,7 +807,8 @@ cmd_docs() {
         else
             printf '| Project | Domain | URL | Tier | Host Port | Container Port | Container | Status | Extras |\n'
             printf '| ------- | ------ | --- | ---- | --------- | -------------- | --------- | ------ | ------ |\n'
-            registry_rows | sort -t$'\t' -k3 -n | while IFS=$'\t' read -r project domain host_port cport mode ws fhttps routes; do
+            registry_rows | sort -t$'\t' -k3 -n | awk 'BEGIN{FS="\t";OFS="\037"}{$1=$1;print}' | \
+              while IFS=$'\037' read -r project domain host_port cport mode ws fhttps routes mbody pextra; do
                 mode="${mode:-$TLS_MODE}"
                 local scheme name status dockinfo tier extras
                 scheme="$(scheme_for "$mode")"
@@ -756,7 +819,9 @@ cmd_docs() {
                 extras=""
                 [[ "${ws:-on}" == "on" ]] && extras+="ws "
                 [[ "$fhttps" == "on" ]]   && extras+="force-https "
-                [[ -n "$routes" ]]        && extras+="routes(${routes//|/, })"
+                [[ -n "$routes" ]]        && extras+="routes(${routes//|/, }) "
+                [[ -n "$mbody" ]]         && extras+="body=${mbody} "
+                [[ -n "$pextra" ]]        && extras+="extra(${pextra})"
                 printf '| %s | %s | %s://%s | %s | %s | %s | %s | %s | %s |\n' \
                     "$project" "$domain" "$scheme" "$domain" "$tier" "$host_port" "$cport" "$name" "$status" "${extras:- }"
             done
@@ -825,7 +890,10 @@ Environment overrides (defaults shown):
   ENABLE_WS=${ENABLE_WS}  (1 = new projects upgrade to WebSocket, 0 = off)
   FORCE_HTTPS=1           (per-project: emit a :80 -> :443 301 redirect)
   ROUTES='/api/=http://127.0.0.1:4000/'   (per-project: extra path upstreams)
-  PROXY_TIMEOUT=${PROXY_TIMEOUT}  CLIENT_MAX_BODY_SIZE=${CLIENT_MAX_BODY_SIZE}
+  MAX_BODY_SIZE=500M      (per-project client_max_body_size override)
+  PROXY_EXTRA='proxy_request_buffering off; proxy_buffering off;'
+                          (per-project: raw server-level nginx directives)
+  PROXY_TIMEOUT=${PROXY_TIMEOUT}  CLIENT_MAX_BODY_SIZE=${CLIENT_MAX_BODY_SIZE}  (global body default)
 
 Example:
   sudo appctl add blog.mutaqorrobin.online          # certbot TLS, frontend tier

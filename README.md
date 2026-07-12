@@ -40,6 +40,9 @@ cert / reload dance for each project, and keeping every TLS block identical.
 - **Multi-upstream domains** — front several containers under one domain by path
   with `ROUTES='/api/=http://127.0.0.1:4000/'`, force `:80`→`:443` with
   `FORCE_HTTPS=1`, and get certbot SSL-hardening includes automatically.
+- **Per-app proxy tuning** — override upload limits per domain with
+  `MAX_BODY_SIZE=500M` and inject arbitrary server directives (e.g. streaming for
+  an object store) with `PROXY_EXTRA='proxy_request_buffering off;'`.
 - **Handover docs** — `appctl docs` prints (and optionally writes) a Markdown
   report of every app: domain, URL, host port, forwarded container port,
   container name, and status.
