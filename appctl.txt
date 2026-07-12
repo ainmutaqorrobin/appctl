@@ -1,0 +1,708 @@
+#!/usr/bin/env bash
+#
+# appctl — port assigner + nginx server-block generator
+#          for host-installed nginx fronting Docker apps.
+#
+# A single registry file is the source of truth mapping project -> host port.
+# `add` allocates the next free port, writes an nginx server block, obtains TLS
+# (certbot/Let's Encrypt by default, or a single shared origin cert), enables it
+# with a sites-enabled symlink, validates the whole config, reloads nginx, and
+# prints the docker-compose mapping to paste in.
+#
+# Usage:
+#   appctl add <domain> [container_port]             # name = domain
+#   appctl add <project> <domain> [container_port]   # name and domain differ
+#   appctl remove <project>
+#   appctl list
+#   appctl next [tier]
+#   appctl ws <project> on|off                       # toggle WebSocket upgrade
+#   appctl docs [output_file]                         # handover report
+#
+# Apps allocate host ports from named tiers (PORT_TIERS), e.g. frontends in
+# 10000-10999 and backends in 11000-11999; choose one per add with TIER=….
+#
+# The container port is OPTIONAL and defaults to DEFAULT_CONTAINER_PORT (8080).
+# nginx proxies to the host port, so the container port only fills the printed
+# docker-compose mapping. All paths/commands are overridable via environment
+# variables (see below), which makes the script testable and adaptable.
+
+set -euo pipefail
+
+# ---- Configuration (override via environment) -------------------------------
+: "${APP_REGISTRY:=/etc/nginx-deploy/registry.tsv}"        # source of truth
+: "${NGINX_SITES_AVAILABLE:=/etc/nginx/sites-available}"   # real server-block files
+: "${NGINX_SITES_ENABLED:=/etc/nginx/sites-enabled}"       # symlinks nginx loads
+: "${NGINX_SNIPPETS_DIR:=/etc/nginx/snippets}"             # where shared snippets go
+# BIND_ADDR is deliberately loopback. Publishing a container on 127.0.0.1 keeps
+# it reachable by the host nginx but NOT the public internet — and, crucially,
+# Docker writes its own iptables rules that BYPASS host firewalls (ufw/firewalld),
+# so a 0.0.0.0 publish would be exposed even with a matching "deny" rule.
+: "${BIND_ADDR:=127.0.0.1}"                                # publish + proxy target
+
+# ---- Port tiers -------------------------------------------------------------
+# Named port bands so different app classes allocate from different ranges, e.g.
+# frontends in 10000-10999, backends in 11000-11999. Add your own bands freely
+# (worker, db, …) — format is "name:start-end", entries separated by spaces and
+# NON-overlapping. Pick a band per `add`/`next` with TIER=… (default DEFAULT_TIER).
+# The tier a project belongs to is recoverable from its allocated port, so it is
+# never stored — reconfigure the bands and `list`/`docs` reflect it immediately.
+: "${PORT_TIERS:=frontend:10000-10999 backend:11000-11999}"
+: "${DEFAULT_TIER:=frontend}"
+: "${DEFAULT_CONTAINER_PORT:=8080}"                        # container port when none given
+: "${NGINX_TEST_CMD:=nginx -t}"
+: "${NGINX_RELOAD_CMD:=systemctl reload nginx}"
+
+# ---- TLS --------------------------------------------------------------------
+# TLS_MODE selects how :443 is secured for a NEW project:
+#   certbot  (default) — obtain a per-domain Let's Encrypt cert with certbot.
+#   shared             — one shared origin cert for every project (SSL_CERT/KEY).
+#                        Works with any origin cert, e.g. a Cloudflare Origin cert.
+#   none               — HTTP-only block, no :443.
+# Each project's chosen mode is recorded in the registry, so regenerating a
+# block later reuses the right cert. ENABLE_SSL=0 is honoured as an alias for
+# TLS_MODE=none (back-compat with older appctl usage).
+: "${TLS_MODE:=certbot}"
+: "${ENABLE_SSL:=1}"                                   # 0 = force TLS_MODE=none
+[[ "$ENABLE_SSL" == "0" ]] && TLS_MODE="none"
+
+# certbot mode: per-domain certs under /etc/letsencrypt/live/<domain>/.
+: "${CERTBOT_CMD:=certbot}"                            # certbot binary (stub in tests)
+: "${CERTBOT_EMAIL:=}"                                 # empty -> register w/o email
+: "${CERTBOT_EXTRA_ARGS:=}"                            # extra flags appended verbatim
+: "${LETSENCRYPT_LIVE:=/etc/letsencrypt/live}"         # where certbot stores live certs
+
+# shared mode: one origin cert/key for every project.
+: "${SSL_CERT:=/etc/ssl/origin/origin.pem}"            # shared origin cert
+: "${SSL_CERT_KEY:=/etc/ssl/origin/origin.key}"        # shared origin key
+
+# ---- WebSocket --------------------------------------------------------------
+# Whether NEW projects get the HTTP->WebSocket upgrade headers. Recorded per
+# project; toggle an existing one with `appctl ws <project> on|off`.
+: "${ENABLE_WS:=1}"                                    # 1 = upgrade on, 0 = off
+
+# ---- Proxy tuning (applied to every project via the shared snippet) ----------
+: "${PROXY_TIMEOUT:=300s}"                             # read + connect timeout
+: "${CLIENT_MAX_BODY_SIZE:=50M}"                       # max upload size
+
+PROXY_SNIPPET="${NGINX_SNIPPETS_DIR}/proxy.conf"
+PROXY_WS_SNIPPET="${NGINX_SNIPPETS_DIR}/proxy-ws.conf"
+WS_MAP_NAME="00-websocket-map"   # lives in sites-available, symlinked enabled
+
+# ---- Small helpers ----------------------------------------------------------
+err()  { printf 'Error: %s\n' "$*" >&2; }
+die()  { err "$*"; exit 1; }
+info() { printf '%s\n' "$*" >&2; }
+
+require_root() {
+    [[ -w "$NGINX_SITES_AVAILABLE" && -w "$NGINX_SITES_ENABLED" ]] && return 0
+    [[ "${EUID:-$(id -u)}" -eq 0 ]] \
+        || die "must run as root (writes into ${NGINX_SITES_AVAILABLE} and ${NGINX_SITES_ENABLED})"
+}
+
+valid_name() { [[ "$1" =~ ^[a-z0-9][a-z0-9._-]*$ ]]; }   # dots allowed: name == domain
+valid_port() { [[ "$1" =~ ^[0-9]+$ ]] && (( $1 >= 1 && $1 <= 65535 )); }
+
+# Normalise a websocket value ("on"/"1"/"yes" -> on, anything else -> off).
+ws_norm() { case "${1,,}" in on|1|yes|true) echo on ;; *) echo off ;; esac; }
+
+# The scheme a project is reachable over, from its TLS mode.
+scheme_for() { case "$1" in none) echo http ;; *) echo https ;; esac; }
+
+# Resolve the cert + key paths for a given (mode, domain). Prints
+# "cert<TAB>key" for certbot/shared, or an empty line for none.
+tls_paths_for() {
+    local mode="$1" domain="$2"
+    case "$mode" in
+        certbot) printf '%s\t%s\n' "${LETSENCRYPT_LIVE}/${domain}/fullchain.pem" \
+                                   "${LETSENCRYPT_LIVE}/${domain}/privkey.pem" ;;
+        shared)  printf '%s\t%s\n' "$SSL_CERT" "$SSL_CERT_KEY" ;;
+        *)       printf '\t\n' ;;
+    esac
+}
+
+# Fail early with a clear message if the SHARED cert is missing, rather than
+# letting `nginx -t` reject the generated :443 block cryptically. certbot mode
+# obtains its own cert, so nothing to check up front; none mode has no cert.
+check_tls_assets() {
+    [[ "$1" == "shared" ]] || return 0
+    [[ -f "$SSL_CERT" ]]     || die "shared ssl cert not found: ${SSL_CERT} (set SSL_CERT=… , use TLS_MODE=certbot, or TLS_MODE=none)"
+    [[ -f "$SSL_CERT_KEY" ]] || die "shared ssl key not found: ${SSL_CERT_KEY} (set SSL_CERT_KEY=… , use TLS_MODE=certbot, or TLS_MODE=none)"
+}
+
+# ---- sites-available <-> sites-enabled (Debian-style enable/disable) ---------
+# Enable a site by symlinking it into sites-enabled (idempotent).
+enable_site()  { ln -sfn "${NGINX_SITES_AVAILABLE}/$1" "${NGINX_SITES_ENABLED}/$1"; }
+
+# Disable AND delete a site: remove the symlink first, then the real file.
+disable_site() { rm -f "${NGINX_SITES_ENABLED}/$1" "${NGINX_SITES_AVAILABLE}/$1"; }
+
+# ---- First-run bootstrap: registry, snippets, websocket map -----------------
+bootstrap() {
+    validate_tiers
+    mkdir -p "$(dirname "$APP_REGISTRY")" \
+             "$NGINX_SITES_AVAILABLE" "$NGINX_SITES_ENABLED" "$NGINX_SNIPPETS_DIR"
+
+    [[ -f "$APP_REGISTRY" ]] || \
+        printf '# project\tdomain\thost_port\tcontainer_port\ttls_mode\twebsocket\n' > "$APP_REGISTRY"
+
+    # The snippets + map are fully owned by appctl, so we (re)generate them on
+    # every run. That way changing PROXY_TIMEOUT / CLIENT_MAX_BODY_SIZE (or
+    # upgrading appctl) propagates to every project on the next command. Note
+    # the unquoted heredoc: bash injects the tunables, so nginx's own runtime
+    # variables are escaped as \$… to reach the file literally.
+    cat > "$PROXY_SNIPPET" <<EOF
+# Managed by appctl — regenerated on every run; edit appctl, not this file.
+# Shared proxy headers + tuning, included by every server block.
+proxy_http_version 1.1;
+proxy_set_header Host               \$host;
+proxy_set_header X-Real-IP          \$remote_addr;
+proxy_set_header X-Forwarded-For    \$proxy_add_x_forwarded_for;
+proxy_set_header X-Forwarded-Proto  \$scheme;
+proxy_connect_timeout  ${PROXY_TIMEOUT};
+proxy_read_timeout     ${PROXY_TIMEOUT};
+client_max_body_size   ${CLIENT_MAX_BODY_SIZE};
+EOF
+
+    # WebSocket upgrade headers, included ONLY by projects with websocket=on.
+    # Kept separate from proxy.conf so a project can opt out of the upgrade.
+    cat > "$PROXY_WS_SNIPPET" <<'EOF'
+# Managed by appctl — regenerated on every run; edit appctl, not this file.
+# HTTP->WebSocket upgrade; included only by projects with websocket=on.
+proxy_set_header Upgrade    $http_upgrade;
+proxy_set_header Connection $appctl_connection_upgrade;
+proxy_cache_bypass          $http_upgrade;
+EOF
+
+    # The map must live at http context. sites-enabled/* is included there, and
+    # the "00-" prefix makes it load before any server block. The variable is
+    # namespaced ($appctl_connection_upgrade) to avoid clashing with a
+    # $connection_upgrade you may already define in a hand-written block.
+    cat > "${NGINX_SITES_AVAILABLE}/${WS_MAP_NAME}" <<'EOF'
+# Managed by appctl. Sets "Connection: upgrade" only for WebSocket requests.
+map $http_upgrade $appctl_connection_upgrade {
+    default upgrade;
+    ''      close;
+}
+EOF
+    enable_site "$WS_MAP_NAME"
+}
+
+# ---- Registry access --------------------------------------------------------
+registry_rows() { grep -vE '^[[:space:]]*(#|$)' "$APP_REGISTRY" 2>/dev/null || true; }
+
+# echoes "domain<TAB>host_port<TAB>container_port<TAB>tls_mode<TAB>websocket";
+# returns 1 if not found. Missing tls_mode/websocket (old 4-column rows) are
+# filled with sensible defaults so upgrades are seamless.
+lookup_project() {
+    registry_rows | awk -F'\t' -v p="$1" -v defmode="$TLS_MODE" '
+        $1==p {
+            mode = ($5=="" ? defmode : $5)
+            ws   = ($6=="" ? "on"    : $6)
+            print $2"\t"$3"\t"$4"\t"mode"\t"ws; f=1
+        } END{exit !f}'
+}
+
+port_taken_in_registry() {
+    registry_rows | awk -F'\t' -v port="$1" '$3==port {f=1} END{exit !f}'
+}
+
+remove_registry_line() {
+    local tmp; tmp="$(mktemp)"
+    awk -F'\t' -v p="$1" 'NF && $1==p {next} {print}' "$APP_REGISTRY" > "$tmp"
+    cat "$tmp" > "$APP_REGISTRY"   # preserve original file perms/owner
+    rm -f "$tmp"
+}
+
+# Append a fully-formed registry row (all six columns).
+write_registry_line() {
+    printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$1" "$2" "$3" "$4" "$5" "$6" >> "$APP_REGISTRY"
+}
+
+# ---- Port tiers -------------------------------------------------------------
+# Space-separated list of the configured tier names (for error messages).
+tier_names() { local e; for e in $PORT_TIERS; do printf '%s ' "${e%%:*}"; done; }
+
+# Validate PORT_TIERS: each entry well-formed, start<=end, and no two overlap
+# (overlap would let two tiers hand out the same port). Dies on any problem.
+validate_tiers() {
+    local -a starts=() ends=() names=()
+    local e name range s eend i j
+    for e in $PORT_TIERS; do
+        [[ "$e" =~ ^[a-z0-9_-]+:[0-9]+-[0-9]+$ ]] || die "malformed PORT_TIERS entry '$e' (want name:start-end)"
+        name="${e%%:*}"; range="${e#*:}"; s="${range%%-*}"; eend="${range#*-}"
+        (( s <= eend )) || die "PORT_TIERS entry '$e' has start > end"
+        starts+=("$s"); ends+=("$eend"); names+=("$name")
+    done
+    (( ${#starts[@]} )) || die "PORT_TIERS is empty (set e.g. 'web:10000-10999')"
+    for (( i=0; i<${#starts[@]}; i++ )); do
+        for (( j=i+1; j<${#starts[@]}; j++ )); do
+            (( starts[i] <= ends[j] && starts[j] <= ends[i] )) \
+                && die "PORT_TIERS ranges overlap: '${names[i]}' and '${names[j]}'"
+        done
+    done
+}
+
+# Resolve a tier name to its range, setting globals RANGE_START/RANGE_END.
+# Returns 1 if the tier isn't configured.
+resolve_tier_range() {
+    local tier="$1" e name range
+    for e in $PORT_TIERS; do
+        name="${e%%:*}"; range="${e#*:}"
+        if [[ "$name" == "$tier" ]]; then
+            RANGE_START="${range%%-*}"; RANGE_END="${range#*-}"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# Reverse lookup: which tier's band contains this port ('-' if none).
+tier_for_port() {
+    local port="$1" e name range s eend
+    for e in $PORT_TIERS; do
+        name="${e%%:*}"; range="${e#*:}"; s="${range%%-*}"; eend="${range#*-}"
+        (( port >= s && port <= eend )) && { printf '%s\n' "$name"; return 0; }
+    done
+    printf '%s\n' "-"
+}
+
+# Decide which tier a NEW project should use. Precedence:
+#   1. TIER=… in the environment always wins (no prompt) — good for scripts.
+#   2. Otherwise, if running interactively (a TTY), prompt with DEFAULT_TIER
+#      pre-filled so the user can just press Enter, and re-ask on a bad answer.
+#   3. Otherwise (non-interactive / piped), fall back silently to DEFAULT_TIER.
+# Set APPCTL_FORCE_PROMPT=1 to force the prompt even without a TTY (used in tests).
+# Prints the chosen tier name on stdout; all prompting goes to stderr.
+prompt_tier() {
+    if [[ -n "${TIER:-}" ]]; then printf '%s\n' "$TIER"; return 0; fi
+    if [[ -t 0 || "${APPCTL_FORCE_PROMPT:-0}" == "1" ]]; then
+        local chosen names_list
+        names_list="$(tier_names | sed 's/ *$//; s/ /, /g')"
+        while true; do
+            printf 'Port tier? [%s] (Enter for default: %s): ' "$names_list" "$DEFAULT_TIER" >&2
+            read -r chosen || chosen=""
+            chosen="${chosen:-$DEFAULT_TIER}"
+            if resolve_tier_range "$chosen"; then printf '%s\n' "$chosen"; return 0; fi
+            printf "  '%s' is not a configured tier (%s). Try again.\n" "$chosen" "$names_list" >&2
+        done
+    fi
+    printf '%s\n' "$DEFAULT_TIER"
+}
+
+# ---- Port allocation --------------------------------------------------------
+port_bound_on_host() {
+    command -v ss >/dev/null 2>&1 || return 1   # can't check; trust the registry
+    ss -tlnH 2>/dev/null | awk '{print $4}' | grep -qE ":${1}\$"
+}
+
+# next_free_port <start> <end> [tier-label] — first free port in [start,end].
+next_free_port() {
+    local start="$1" end="$2" label="${3:-}" p
+    for (( p=start; p<=end; p++ )); do
+        port_taken_in_registry "$p" && continue
+        port_bound_on_host "$p"     && continue
+        printf '%s\n' "$p"
+        return 0
+    done
+    err "no free ports left in ${label:+tier '$label' }range ${start}-${end}"
+    return 1
+}
+
+# ---- Config generation ------------------------------------------------------
+# write_server_block <project> <domain> <host_port> <cert_path> <cert_key> <ws>
+# An empty cert_path emits a plain HTTP block (no :443). ws is on|off.
+write_server_block() {
+    local project="$1" domain="$2" host_port="$3" cert="$4" cert_key="$5" ws="$6"
+    local fname="${project}"   # file named exactly like the project/domain, no .conf
+    local conf="${NGINX_SITES_AVAILABLE}/${fname}"
+
+    # Conditional TLS lines. With an empty cert path the block is plain HTTP.
+    local tls_lines=""
+    if [[ -n "$cert" ]]; then
+        tls_lines="$(cat <<EOF
+    listen 443 ssl;
+    listen [::]:443 ssl;
+    ssl_certificate     ${cert};
+    ssl_certificate_key ${cert_key};
+EOF
+)"
+    fi
+
+    # Include the WebSocket upgrade snippet only when this project opted in.
+    local ws_include=""
+    [[ "$ws" == "on" ]] && ws_include="        include ${PROXY_WS_SNIPPET};"
+
+    cat > "$conf" <<EOF
+# Managed by appctl — project: ${project}
+# Regenerate with: appctl add ${project} ${domain} [container_port]
+server {
+    listen 80;
+    listen [::]:80;
+${tls_lines}
+    server_name ${domain};
+
+    location / {
+        proxy_pass http://${BIND_ADDR}:${host_port};
+        include ${PROXY_SNIPPET};
+${ws_include}
+    }
+}
+EOF
+    enable_site "$fname"
+    printf '%s\n' "$conf"
+}
+
+# Obtain (or reuse) a Let's Encrypt cert for a domain via certbot. Returns 0 on
+# success. Uses the nginx authenticator so the already-running HTTP block serves
+# the http-01 challenge; certonly means certbot never edits our nginx file.
+obtain_certbot_cert() {
+    local domain="$1"
+    local -a args=(certonly --nginx -d "$domain" --non-interactive --agree-tos --keep-until-expiring)
+    if [[ -n "$CERTBOT_EMAIL" ]]; then
+        args+=(--email "$CERTBOT_EMAIL")
+    else
+        args+=(--register-unsafely-without-email)
+    fi
+    # shellcheck disable=SC2206
+    [[ -n "$CERTBOT_EXTRA_ARGS" ]] && args+=($CERTBOT_EXTRA_ARGS)
+    $CERTBOT_CMD "${args[@]}"
+}
+
+print_compose_snippet() {
+    local project="$1" host_port="$2" container_port="$3"
+    cat <<EOF
+
+# ---- docker-compose port mapping for '${project}' ----------------------------
+# Bind to loopback (${BIND_ADDR}) ONLY: reachable by nginx, NOT the public net.
+# Do not change it to 0.0.0.0 — Docker's iptables rules bypass ufw/firewalld, so
+# a 0.0.0.0 publish is internet-exposed even behind a firewall "deny" rule.
+# (container port ${container_port} — make sure your app actually listens on it):
+    ports:
+      - "${BIND_ADDR}:${host_port}:${container_port}"
+# ------------------------------------------------------------------------------
+EOF
+}
+
+# Test config, then reload; on test failure run <rollback fn> and exit 1.
+test_reload_or_rollback() {
+    local rollback="$1"
+    if ! $NGINX_TEST_CMD >/dev/null 2>&1; then
+        err "nginx config test failed — rolling back, the running nginx is untouched."
+        "$rollback"
+        $NGINX_TEST_CMD || true   # show the user the actual error
+        exit 1
+    fi
+    $NGINX_RELOAD_CMD
+}
+
+# ---- Commands ---------------------------------------------------------------
+cmd_add() {
+    # The container port is an OPTIONAL trailing number (defaults to
+    # DEFAULT_CONTAINER_PORT); the project name is optional and defaults to the
+    # domain. The trailing port is detected by being numeric:
+    #   add <domain>                    -> name=domain,  port=default
+    #   add <domain> <port>             -> name=domain,  port given
+    #   add <project> <domain>          -> name!=domain, port=default
+    #   add <project> <domain> <port>   -> all explicit
+    local project domain container_port="" explicit_port=0
+    case $# in
+        1) project="$1"; domain="$1" ;;
+        2) if valid_port "$2"; then
+               project="$1"; domain="$1"; container_port="$2"; explicit_port=1
+           else
+               project="$1"; domain="$2"
+           fi ;;
+        3) project="$1"; domain="$2"; container_port="$3"; explicit_port=1 ;;
+        *) die "usage: appctl add <domain> [container_port]
+       or: appctl add <project> <domain> [container_port]" ;;
+    esac
+    container_port="${container_port:-$DEFAULT_CONTAINER_PORT}"
+    valid_name "$project"        || die "invalid project name '$project' (allowed: a-z 0-9 . _ -)"
+    valid_port "$container_port" || die "invalid container port '$container_port'"
+
+    local tls_mode="$TLS_MODE" ws; ws="$( [[ "$ENABLE_WS" == "1" ]] && echo on || echo off )"
+    case "$tls_mode" in certbot|shared|none) ;; *) die "invalid TLS_MODE '$tls_mode' (certbot|shared|none)" ;; esac
+
+    require_root
+    bootstrap
+    check_tls_assets "$tls_mode"
+
+    local host_port existing="" stored_cport="" stored_mode="" stored_ws=""
+    if existing="$(lookup_project "$project")"; then
+        host_port="$(printf '%s' "$existing" | cut -f2)"
+        stored_cport="$(printf '%s' "$existing" | cut -f3)"
+        stored_mode="$(printf '%s' "$existing" | cut -f4)"
+        stored_ws="$(printf '%s' "$existing" | cut -f5)"
+        # A re-add keeps the recorded container port (and its port/tier) unless a
+        # new one is given.
+        (( explicit_port )) || container_port="${stored_cport:-$container_port}"
+        info "Project '$project' already maps to host port ${host_port}; regenerating its config."
+    else
+        # Choose (prompt / env / default) then allocate from that tier's band.
+        local tier; tier="$(prompt_tier)"
+        resolve_tier_range "$tier" \
+            || die "unknown tier '$tier' (available: $(tier_names)); configure PORT_TIERS"
+        host_port="$(next_free_port "$RANGE_START" "$RANGE_END" "$tier")" || exit 1
+        write_registry_line "$project" "$domain" "$host_port" "$container_port" "$tls_mode" "$ws"
+        info "Allocated host port ${host_port} (tier '$tier') -> '$project'."
+    fi
+
+    # Resolve cert paths for the chosen mode.
+    local cert cert_key
+    IFS=$'\t' read -r cert cert_key < <(tls_paths_for "$tls_mode" "$domain")
+
+    _rollback_add() { disable_site "${project}"; [[ -n "$existing" ]] || remove_registry_line "$project"; }
+
+    if [[ "$tls_mode" == "certbot" ]]; then
+        # Phase 1: HTTP-only block so certbot's http-01 challenge can be served.
+        write_server_block "$project" "$domain" "$host_port" "" "" "$ws" >/dev/null
+        test_reload_or_rollback _rollback_add
+
+        # Phase 2: obtain the cert. On failure keep the working HTTP route.
+        if [[ -f "$cert" ]] || obtain_certbot_cert "$domain"; then
+            # Phase 3: rewrite with :443. On test failure fall back to HTTP-only.
+            write_server_block "$project" "$domain" "$host_port" "$cert" "$cert_key" "$ws" >/dev/null
+            _rollback_https() { write_server_block "$project" "$domain" "$host_port" "" "" "$ws" >/dev/null; }
+            test_reload_or_rollback _rollback_https
+        else
+            err "certbot failed to obtain a cert for ${domain} — leaving the HTTP-only route up."
+            err "Fix DNS / port 80 reachability, then re-run: appctl add ${project} ${domain} ${container_port}"
+            cert=""   # so the final summary line shows http://
+        fi
+    else
+        # shared / none: single-phase write with the resolved cert paths.
+        write_server_block "$project" "$domain" "$host_port" "$cert" "$cert_key" "$ws" >/dev/null
+        test_reload_or_rollback _rollback_add
+    fi
+
+    # Persist changed fields for an existing project. Done only after a
+    # successful test+reload, so a failure can never leave a dangling row.
+    if [[ -n "$existing" ]] && \
+       { [[ "$container_port" != "$stored_cport" ]] || [[ "$tls_mode" != "$stored_mode" ]] || [[ "$ws" != "$stored_ws" ]]; }; then
+        remove_registry_line "$project"
+        write_registry_line "$project" "$domain" "$host_port" "$container_port" "$tls_mode" "$ws"
+    fi
+
+    local scheme; scheme="$( [[ -n "$cert" ]] && echo https || echo http )"
+    info "Reloaded nginx: ${scheme}://${domain} -> ${BIND_ADDR}:${host_port} (tls=${tls_mode}, ws=${ws})"
+    print_compose_snippet "$project" "$host_port" "$container_port"
+}
+
+cmd_remove() {
+    local project="${1:-}"
+    [[ -n "$project" ]] || die "usage: appctl remove <project>"
+    require_root
+    bootstrap
+
+    lookup_project "$project" >/dev/null || die "project '$project' is not in the registry."
+
+    disable_site "${project}"
+    remove_registry_line "$project"
+
+    if $NGINX_TEST_CMD >/dev/null 2>&1; then
+        $NGINX_RELOAD_CMD
+        info "Removed '$project'; its port is now free for reuse. nginx reloaded."
+    else
+        err "nginx test failed after removal — NOT reloading. Inspect manually."
+    fi
+    info "Reminder: stop the container too (run 'docker compose down' in its project folder)."
+}
+
+cmd_list() {
+    bootstrap
+    if [[ -z "$(registry_rows)" ]]; then
+        info "No apps registered yet."
+        return 0
+    fi
+    printf '%-24s %-30s %-10s %-15s %-10s %-8s %s\n' \
+        "PROJECT" "DOMAIN" "HOST_PORT" "CONTAINER_PORT" "TIER" "TLS" "WS"
+    registry_rows | sort -t$'\t' -k3 -n | \
+        while IFS=$'\t' read -r project domain host_port cport mode ws; do
+            printf '%-24s %-30s %-10s %-15s %-10s %-8s %s\n' \
+                "$project" "$domain" "$host_port" "$cport" \
+                "$(tier_for_port "$host_port")" "${mode:-$TLS_MODE}" "${ws:-on}"
+        done
+}
+
+# next [tier] — print the next free port in a tier's band without allocating it.
+cmd_next() {
+    bootstrap
+    local tier="${1:-${TIER:-$DEFAULT_TIER}}"
+    resolve_tier_range "$tier" \
+        || die "unknown tier '$tier' (available: $(tier_names)); configure PORT_TIERS"
+    next_free_port "$RANGE_START" "$RANGE_END" "$tier"
+}
+
+# ---- ws: toggle the WebSocket upgrade for an existing project ---------------
+cmd_ws() {
+    local project="${1:-}" want="${2:-}"
+    [[ -n "$project" && -n "$want" ]] || die "usage: appctl ws <project> on|off"
+    case "${want,,}" in on|off) want="${want,,}" ;; *) die "usage: appctl ws <project> on|off" ;; esac
+
+    require_root
+    bootstrap
+
+    local row domain host_port container_port tls_mode ws
+    row="$(lookup_project "$project")" || die "project '$project' is not in the registry."
+    domain="$(printf '%s' "$row" | cut -f1)"
+    host_port="$(printf '%s' "$row" | cut -f2)"
+    container_port="$(printf '%s' "$row" | cut -f3)"
+    tls_mode="$(printf '%s' "$row" | cut -f4)"
+    ws="$(printf '%s' "$row" | cut -f5)"
+
+    if [[ "$ws" == "$want" ]]; then
+        info "WebSocket upgrade already '${want}' for '${project}'. Nothing to do."
+        return 0
+    fi
+
+    local cert cert_key
+    IFS=$'\t' read -r cert cert_key < <(tls_paths_for "$tls_mode" "$domain")
+    # If a certbot/shared cert isn't actually present, regenerate HTTP-only so
+    # we don't emit a :443 block pointing at a missing file.
+    [[ -n "$cert" && ! -f "$cert" ]] && { cert=""; cert_key=""; }
+
+    write_server_block "$project" "$domain" "$host_port" "$cert" "$cert_key" "$want" >/dev/null
+
+    _rollback_ws() { write_server_block "$project" "$domain" "$host_port" "$cert" "$cert_key" "$ws" >/dev/null; }
+    test_reload_or_rollback _rollback_ws
+
+    remove_registry_line "$project"
+    write_registry_line "$project" "$domain" "$host_port" "$container_port" "$tls_mode" "$want"
+    info "WebSocket upgrade set to '${want}' for '${project}'. nginx reloaded."
+}
+
+# ---- docs: handover report of everything appctl manages ---------------------
+# Joins the registry with `docker ps` so a colleague can see, at a glance, what
+# runs where: domain, URL, host port, forwarded container port, container name,
+# and status. Prints to stdout; also writes a file when a path is given.
+cmd_docs() {
+    bootstrap
+    local out="${1:-}"
+
+    # Snapshot docker once: "host_port\tname\tstatus" per published loopback port.
+    local docker_snapshot=""
+    if command -v docker >/dev/null 2>&1; then
+        docker_snapshot="$(docker ps -a --format '{{.Names}}\t{{.Ports}}\t{{.Status}}' 2>/dev/null || true)"
+    fi
+
+    # Look a host port up in the docker snapshot -> "name\tstatus" (or unknowns).
+    _docker_for_port() {
+        local port="$1"
+        [[ -n "$docker_snapshot" ]] || { printf 'unknown\tunknown\n'; return; }
+        printf '%s\n' "$docker_snapshot" | awk -F'\t' -v p=":${port}->" '
+            index($2, p) { print $1"\t"$3; f=1; exit }
+            END { if (!f) print "not running\tnot found" }'
+    }
+
+    local generated; generated="$(date '+%Y-%m-%d %H:%M:%S %Z' 2>/dev/null || echo 'unknown')"
+
+    # Build the report into a variable so we can both print and (optionally) save.
+    local report; report="$(
+        printf '# Running applications (appctl handover)\n\n'
+        printf '_Generated: %s_\n\n' "$generated"
+        printf 'Host nginx fronts these Docker apps. Each app publishes on %s:<host_port>;\n' "$BIND_ADDR"
+        printf 'nginx proxies to it and terminates TLS. Ports are allocated per tier: %s.\n\n' "$PORT_TIERS"
+
+        if [[ -z "$(registry_rows)" ]]; then
+            printf '_No apps registered yet._\n'
+        else
+            printf '| Project | Domain | URL | Tier | Host Port | Container Port | Container | Status |\n'
+            printf '| ------- | ------ | --- | ---- | --------- | -------------- | --------- | ------ |\n'
+            registry_rows | sort -t$'\t' -k3 -n | while IFS=$'\t' read -r project domain host_port cport mode ws; do
+                mode="${mode:-$TLS_MODE}"
+                local scheme name status dockinfo tier
+                scheme="$(scheme_for "$mode")"
+                tier="$(tier_for_port "$host_port")"
+                dockinfo="$(_docker_for_port "$host_port")"
+                name="$(printf '%s' "$dockinfo" | cut -f1)"
+                status="$(printf '%s' "$dockinfo" | cut -f2)"
+                printf '| %s | %s | %s://%s | %s | %s | %s | %s | %s |\n' \
+                    "$project" "$domain" "$scheme" "$domain" "$tier" "$host_port" "$cport" "$name" "$status"
+            done
+        fi
+    )"
+
+    printf '%s\n' "$report"
+    if [[ -n "$out" ]]; then
+        printf '%s\n' "$report" > "$out"
+        info "Wrote handover report to ${out}"
+    fi
+}
+
+usage() {
+    cat <<EOF
+appctl — port assigner + nginx server-block generator for host nginx + Docker
+
+Commands:
+  add <domain> [container_port]
+  add <project> <domain> [container_port]
+        Allocate the next free host port, write the server block into
+        sites-available, obtain TLS (TLS_MODE), enable it via a sites-enabled
+        symlink, reload nginx, and print the docker-compose 'ports:' mapping.
+        The container port is optional and defaults to ${DEFAULT_CONTAINER_PORT};
+        the domain doubles as the project name unless a separate one is given.
+        For a new project you're prompted which port tier to use (default
+        ${DEFAULT_TIER}); set TIER=<name> to skip the prompt (e.g. in scripts).
+        Safe to re-run for an existing project (keeps its port, regenerates).
+
+  remove <project>
+        Delete the project's nginx block (symlink + file) and free its port.
+        (Does not stop the container — do that with docker compose in the folder.)
+
+  ws <project> on|off
+        Turn the HTTP->WebSocket upgrade on or off for an existing project and
+        regenerate its nginx block.
+
+  docs [output_file]
+        Print a Markdown handover report of every app (domain, URL, host port,
+        forwarded container port, container name, status). Writes it to a file
+        too when a path is given.
+
+  list  List all project -> port -> domain mappings (with tier, TLS mode + WS).
+  next [tier]
+        Print the next free port in a tier's band without allocating it
+        (default tier: ${DEFAULT_TIER}).
+
+Environment overrides (defaults shown):
+  APP_REGISTRY=${APP_REGISTRY}
+  NGINX_SITES_AVAILABLE=${NGINX_SITES_AVAILABLE}
+  NGINX_SITES_ENABLED=${NGINX_SITES_ENABLED}
+  NGINX_SNIPPETS_DIR=${NGINX_SNIPPETS_DIR}
+  PORT_TIERS="${PORT_TIERS}"
+  DEFAULT_TIER=${DEFAULT_TIER}  (pre-filled default; 'add' prompts when interactive)
+  TIER=<name>                   (set to skip the prompt — scripts / non-interactive)
+  BIND_ADDR=${BIND_ADDR}  (loopback on purpose — 0.0.0.0 bypasses ufw via Docker)
+  DEFAULT_CONTAINER_PORT=${DEFAULT_CONTAINER_PORT}
+  NGINX_TEST_CMD="${NGINX_TEST_CMD}"
+  NGINX_RELOAD_CMD="${NGINX_RELOAD_CMD}"
+  TLS_MODE=${TLS_MODE}  (certbot | shared | none; ENABLE_SSL=0 forces none)
+  CERTBOT_CMD="${CERTBOT_CMD}"  CERTBOT_EMAIL="${CERTBOT_EMAIL}"
+  SSL_CERT=${SSL_CERT}          (shared mode)
+  SSL_CERT_KEY=${SSL_CERT_KEY}  (shared mode)
+  ENABLE_WS=${ENABLE_WS}  (1 = new projects upgrade to WebSocket, 0 = off)
+  PROXY_TIMEOUT=${PROXY_TIMEOUT}  CLIENT_MAX_BODY_SIZE=${CLIENT_MAX_BODY_SIZE}
+
+Example:
+  sudo appctl add blog.mutaqorrobin.online          # certbot TLS, frontend tier
+  sudo appctl add blog.mutaqorrobin.online 3000     # or pass the container port
+  sudo TIER=backend appctl add api.mutaqorrobin.online 8080   # allocate 11000-11999
+  sudo TLS_MODE=shared appctl add api.mutaqorrobin.online     # use the shared cert
+  appctl next backend                               # peek the next backend port
+EOF
+}
+
+main() {
+    local cmd="${1:-}"; shift || true
+    case "$cmd" in
+        add)        cmd_add "$@" ;;
+        remove|rm)  cmd_remove "$@" ;;
+        list|ls)    cmd_list "$@" ;;
+        next)       cmd_next "$@" ;;
+        ws)         cmd_ws "$@" ;;
+        docs|report) cmd_docs "$@" ;;
+        ""|-h|--help|help) usage ;;
+        *) die "unknown command '$cmd' (try: add, remove, list, next, ws, docs)" ;;
+    esac
+}
+
+main "$@"
