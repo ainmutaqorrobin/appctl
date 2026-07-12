@@ -697,7 +697,7 @@ cmd_remove() {
 }
 
 cmd_list() {
-    bootstrap
+    validate_tiers   # read-only: no bootstrap writes, so this runs without root
     if [[ -z "$(registry_rows)" ]]; then
         info "No apps registered yet."
         return 0
@@ -721,7 +721,7 @@ cmd_list() {
 
 # next [tier] — print the next free port in a tier's band without allocating it.
 cmd_next() {
-    bootstrap
+    validate_tiers   # read-only: no bootstrap writes, so this runs without root
     local tier="${1:-${TIER:-$DEFAULT_TIER}}"
     resolve_tier_range "$tier" \
         || die "unknown tier '$tier' (available: $(tier_names)); configure PORT_TIERS"
@@ -775,7 +775,7 @@ cmd_ws() {
 # runs where: domain, URL, host port, forwarded container port, container name,
 # and status. Prints to stdout; also writes a file when a path is given.
 cmd_docs() {
-    bootstrap
+    validate_tiers   # read-only: no bootstrap writes, so this runs without root
     local out="${1:-}"
 
     # Snapshot docker once: "host_port\tname\tstatus" per published loopback port.

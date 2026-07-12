@@ -155,10 +155,17 @@ Verify it's installed:
 appctl --help
 ```
 
-The first time you run an `add` (or `list`/`next`), `appctl` **bootstraps
-itself** — it creates the registry, a shared proxy-headers snippet, a
-WebSocket-upgrade snippet, and a WebSocket map (symlinked into `sites-enabled`).
-You don't set anything up manually.
+The first time you run an `add`, `appctl` **bootstraps itself** — it creates the
+registry, a shared proxy-headers snippet, a WebSocket-upgrade snippet, and a
+WebSocket map (symlinked into `sites-enabled`). You don't set anything up
+manually.
+
+> **Which commands need `sudo`?** Only the ones that change nginx —
+> `add`, `remove`, and `ws` — write into `/etc/nginx` and reload, so they need
+> root. The read-only commands — **`list`, `next`, `docs`** — only read the
+> registry and run fine as your normal user (no `sudo`). For passwordless writes,
+> a sudoers drop-in works well:
+> `you ALL=(root) NOPASSWD:SETENV: /usr/local/bin/appctl`.
 
 ---
 
