@@ -37,6 +37,9 @@ cert / reload dance for each project, and keeping every TLS block identical.
   (`TLS_MODE=none`).
 - **Per-app WebSocket upgrade** — on by default; opt out with `ENABLE_WS=0`, or
   flip an existing app with `appctl ws <project> on|off`.
+- **Multi-upstream domains** — front several containers under one domain by path
+  with `ROUTES='/api/=http://127.0.0.1:4000/'`, force `:80`→`:443` with
+  `FORCE_HTTPS=1`, and get certbot SSL-hardening includes automatically.
 - **Handover docs** — `appctl docs` prints (and optionally writes) a Markdown
   report of every app: domain, URL, host port, forwarded container port,
   container name, and status.

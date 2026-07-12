@@ -324,7 +324,11 @@ separate one is given.
 For a new project, `add` **prompts for the port tier** (default pre-filled);
 set `TIER=<name>` to skip the prompt. Set `TLS_MODE=shared` to use the shared
 origin cert, or `TLS_MODE=none` (or `ENABLE_SSL=0`) for an HTTP-only block. Set
-`ENABLE_WS=0` to skip the WebSocket-upgrade headers for this project.
+`ENABLE_WS=0` to skip the WebSocket-upgrade headers. Add
+[`FORCE_HTTPS=1`](#forcing-http--https-force_https) for a `:80`→`:443` redirect,
+and [`ROUTES=…`](#fronting-several-containers-under-one-domain-routes) to front
+extra path-based upstreams (e.g. `/api`) under the same domain. All of these are
+recorded per project and preserved across re-`add`.
 
 **Re-running is safe.** If the project already exists, `appctl` keeps its
 existing port and just regenerates the config (useful after changing
@@ -645,6 +649,52 @@ The `WS` column in `appctl list` shows each project's current setting.
 
 ---
 
+## Fronting several containers under one domain (`ROUTES`)
+
+By default a project is one domain → one upstream. Some apps front **several
+containers by path** — e.g. a frontend at `/` and a backend API at `/api/`.
+`ROUTES` adds extra `location` blocks (rendered **before** the catch-all
+`location /`) that proxy a path to any upstream you name:
+
+```bash
+sudo ROUTES='/api/=http://127.0.0.1:4000/' \
+     appctl add book-review.mutaqorrobin.online 3000
+```
+
+- Format: pipe-separated `path=upstream` pairs —
+  `'/api/=http://127.0.0.1:4000/|/ws=http://127.0.0.1:5000'`.
+- The **upstream is emitted verbatim**, so `proxy_pass` trailing-slash semantics
+  are yours to control: `.../4000/` (trailing slash) strips the matched `/api/`
+  prefix; `.../4000` (no slash) passes the full path through.
+- The main app still gets an appctl-allocated tier port for `location /`; the
+  extra upstreams are fixed addresses you manage (they can be other appctl apps,
+  a container on a known port, anything nginx can reach).
+- Routes are recorded per project, so `ws`, re-`add`, and snippet regenerations
+  preserve them. Pass `ROUTES=''` on a re-`add` to clear them.
+
+## Forcing HTTP → HTTPS (`FORCE_HTTPS`)
+
+By default an appctl block serves the same content on `:80` and `:443` (the edge —
+e.g. Cloudflare — handles the redirect in that model). For a **directly-served**
+domain you usually want a hard redirect. `FORCE_HTTPS=1` emits a dedicated `:80`
+server that `301`-redirects to `https`, plus the `:443` server:
+
+```bash
+sudo FORCE_HTTPS=1 appctl add book-review.mutaqorrobin.online
+```
+
+It only takes effect when the project actually has a cert (certbot/shared);
+it's ignored for `TLS_MODE=none`. Like routes, it's stored per project.
+
+## TLS hardening (certbot options)
+
+When a `:443` block is written, appctl **includes the certbot hardening files if
+they exist** — `SSL_OPTIONS_FILE` (`/etc/letsencrypt/options-ssl-nginx.conf`, the
+Mozilla-grade protocols/ciphers) and `SSL_DHPARAM_FILE`
+(`/etc/letsencrypt/ssl-dhparams.pem`). So an appctl certbot block ends up with the
+same hardening a `certbot --nginx` block would. Both paths are overridable; if the
+files are absent they're simply skipped.
+
 ## Migrating an existing hand-written block to appctl
 
 You may already have hand-written blocks in `sites-available` (named by domain,
@@ -698,8 +748,12 @@ Every default can be overridden with an environment variable. Defaults:
 | `CERTBOT_EXTRA_ARGS`    | _(empty)_                        | Extra certbot flags (e.g. `--staging`)              |
 | `SSL_CERT`              | `/etc/ssl/origin/origin.pem`     | Shared TLS certificate (shared mode)                |
 | `SSL_CERT_KEY`          | `/etc/ssl/origin/origin.key`     | Shared TLS private key (shared mode)                |
+| `SSL_OPTIONS_FILE`      | `/etc/letsencrypt/options-ssl-nginx.conf` | `include`d in `:443` if the file exists    |
+| `SSL_DHPARAM_FILE`      | `/etc/letsencrypt/ssl-dhparams.pem` | `ssl_dhparam` in `:443` if the file exists       |
 | `ENABLE_SSL`            | `1`                              | `0` forces `TLS_MODE=none` (back-compat)            |
 | `ENABLE_WS`             | `1`                              | `1` = new projects upgrade to WebSocket; `0` = off  |
+| `FORCE_HTTPS`           | _(unset)_                        | `1` = per-project `:80`→`:443` 301 redirect         |
+| `ROUTES`                | _(unset)_                        | Per-project extra path upstreams (`path=upstream\|…`) |
 | `PROXY_TIMEOUT`         | `300s`                           | `proxy_connect_timeout` + `proxy_read_timeout`      |
 | `CLIENT_MAX_BODY_SIZE`  | `50M`                            | `client_max_body_size` (max upload)                 |
 | `NGINX_TEST_CMD`        | `nginx -t`                       | Command to validate config                          |

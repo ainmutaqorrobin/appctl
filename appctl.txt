@@ -89,6 +89,32 @@ set -euo pipefail
 : "${SSL_CERT:=/etc/ssl/origin/origin.pem}"            # shared origin cert
 : "${SSL_CERT_KEY:=/etc/ssl/origin/origin.key}"        # shared origin key
 
+# TLS hardening: if these files exist they're pulled into every :443 block.
+# certbot creates both, so a certbot-fronted block gets the same Mozilla-grade
+# ssl_protocols/ciphers and DH params a hand-written certbot block would have.
+: "${SSL_OPTIONS_FILE:=/etc/letsencrypt/options-ssl-nginx.conf}"
+: "${SSL_DHPARAM_FILE:=/etc/letsencrypt/ssl-dhparams.pem}"
+
+# ---- HTTP -> HTTPS redirect -------------------------------------------------
+# FORCE_HTTPS=1 makes a NEW project emit a dedicated :80 server that 301-redirects
+# to https, instead of serving the same content on both :80 and :443. Recorded
+# per project. Only takes effect when the project actually has a cert (certbot or
+# shared); ignored for TLS_MODE=none. Off by default so the edge-terminated
+# (e.g. Cloudflare) model is unchanged.
+#   FORCE_HTTPS=1
+#
+# ---- Extra path routes ------------------------------------------------------
+# A domain usually maps to one upstream, but some front several containers by
+# path (e.g. /api -> a backend). ROUTES adds extra location blocks BEFORE the
+# main "location /". Format: pipe-separated "path=upstream" pairs, upstream given
+# verbatim (mind proxy_pass trailing-slash semantics). Recorded per project.
+#   ROUTES='/api/=http://127.0.0.1:4000/'
+#   ROUTES='/api/=http://127.0.0.1:4000/|/ws=http://127.0.0.1:5000'
+#
+# FORCE_HTTPS and ROUTES are intentionally NOT given defaults here: leaving them
+# unset lets `add` tell "user asked for this" from "not mentioned" so a re-add
+# preserves a project's stored redirect/routes instead of clobbering them.
+
 # ---- WebSocket --------------------------------------------------------------
 # Whether NEW projects get the HTTP->WebSocket upgrade headers. Recorded per
 # project; toggle an existing one with `appctl ws <project> on|off`.
@@ -118,6 +144,25 @@ valid_port() { [[ "$1" =~ ^[0-9]+$ ]] && (( $1 >= 1 && $1 <= 65535 )); }
 
 # Normalise a websocket value ("on"/"1"/"yes" -> on, anything else -> off).
 ws_norm() { case "${1,,}" in on|1|yes|true) echo on ;; *) echo off ;; esac; }
+
+# on/off for a boolean-ish flag ("1"/"on"/"yes"/"true" -> on).
+onoff() { case "${1,,}" in 1|on|yes|true) echo on ;; *) echo off ;; esac; }
+
+# Validate a ROUTES spec ("path=upstream|path=upstream"). Each path must start
+# with "/" and each upstream with "http". Registry-stored, so also reject tabs.
+validate_routes() {
+    local spec="$1" entry path upstream
+    [[ -n "$spec" ]] || return 0
+    [[ "$spec" == *$'\t'* ]] && die "ROUTES may not contain tab characters"
+    local IFS='|'
+    for entry in $spec; do
+        [[ -n "$entry" ]] || continue
+        [[ "$entry" == *=* ]]        || die "invalid route '$entry' (want path=upstream)"
+        path="${entry%%=*}"; upstream="${entry#*=}"
+        [[ "$path" == /* ]]          || die "invalid route path '$path' (must start with /)"
+        [[ "$upstream" == http*://* ]] || die "invalid route upstream '$upstream' (must be an http(s):// URL)"
+    done
+}
 
 # The scheme a project is reachable over, from its TLS mode.
 scheme_for() { case "$1" in none) echo http ;; *) echo https ;; esac; }
@@ -157,7 +202,7 @@ bootstrap() {
              "$NGINX_SITES_AVAILABLE" "$NGINX_SITES_ENABLED" "$NGINX_SNIPPETS_DIR"
 
     [[ -f "$APP_REGISTRY" ]] || \
-        printf '# project\tdomain\thost_port\tcontainer_port\ttls_mode\twebsocket\n' > "$APP_REGISTRY"
+        printf '# project\tdomain\thost_port\tcontainer_port\ttls_mode\twebsocket\tforce_https\troutes\n' > "$APP_REGISTRY"
 
     # The snippets + map are fully owned by appctl, so we (re)generate them on
     # every run. That way changing PROXY_TIMEOUT / CLIENT_MAX_BODY_SIZE (or
@@ -204,15 +249,18 @@ EOF
 # ---- Registry access --------------------------------------------------------
 registry_rows() { grep -vE '^[[:space:]]*(#|$)' "$APP_REGISTRY" 2>/dev/null || true; }
 
-# echoes "domain<TAB>host_port<TAB>container_port<TAB>tls_mode<TAB>websocket";
-# returns 1 if not found. Missing tls_mode/websocket (old 4-column rows) are
+# echoes 7 tab-separated fields:
+#   domain  host_port  container_port  tls_mode  websocket  force_https  routes
+# returns 1 if not found. Missing trailing columns (older, narrower rows) are
 # filled with sensible defaults so upgrades are seamless.
 lookup_project() {
     registry_rows | awk -F'\t' -v p="$1" -v defmode="$TLS_MODE" '
         $1==p {
-            mode = ($5=="" ? defmode : $5)
-            ws   = ($6=="" ? "on"    : $6)
-            print $2"\t"$3"\t"$4"\t"mode"\t"ws; f=1
+            mode   = ($5=="" ? defmode : $5)
+            ws     = ($6=="" ? "on"    : $6)
+            fhttps = ($7=="" ? "off"   : $7)
+            routes = $8   # may be empty
+            print $2"\t"$3"\t"$4"\t"mode"\t"ws"\t"fhttps"\t"routes; f=1
         } END{exit !f}'
 }
 
@@ -227,9 +275,11 @@ remove_registry_line() {
     rm -f "$tmp"
 }
 
-# Append a fully-formed registry row (all six columns).
+# Append a fully-formed registry row (all eight columns):
+#   project domain host_port container_port tls_mode websocket force_https routes
 write_registry_line() {
-    printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$1" "$2" "$3" "$4" "$5" "$6" >> "$APP_REGISTRY"
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+        "$1" "$2" "$3" "$4" "$5" "$6" "$7" "$8" >> "$APP_REGISTRY"
 }
 
 # ---- Port tiers -------------------------------------------------------------
@@ -323,45 +373,101 @@ next_free_port() {
 }
 
 # ---- Config generation ------------------------------------------------------
-# write_server_block <project> <domain> <host_port> <cert_path> <cert_key> <ws>
-# An empty cert_path emits a plain HTTP block (no :443). ws is on|off.
+# write_server_block <project> <domain> <host_port> <cert> <cert_key> <ws> \
+#                    [force_https] [routes]
+#   cert empty        -> plain HTTP block (no :443).
+#   ws                -> on|off (WebSocket upgrade headers).
+#   force_https on    -> with a cert, emit a :80 -> :443 301 redirect + TLS block.
+#   routes            -> "path=upstream|…" extra locations rendered before "/".
+# When a cert is present, the certbot hardening files (SSL_OPTIONS_FILE /
+# SSL_DHPARAM_FILE) are included if they exist on disk.
 write_server_block() {
     local project="$1" domain="$2" host_port="$3" cert="$4" cert_key="$5" ws="$6"
+    local force_https="${7:-off}" routes="${8:-}"
     local fname="${project}"   # file named exactly like the project/domain, no .conf
     local conf="${NGINX_SITES_AVAILABLE}/${fname}"
 
-    # Conditional TLS lines. With an empty cert path the block is plain HTTP.
-    local tls_lines=""
+    # WS include line appended inside each location when this project opted in.
+    local ws_line=""
+    [[ "$ws" == "on" ]] && ws_line=$'\n        include '"${PROXY_WS_SNIPPET}"';'
+
+    # Location blocks: any extra path routes first, then the catch-all "location /".
+    local locations="" entry path upstream
+    if [[ -n "$routes" ]]; then
+        local oldifs="$IFS"; IFS='|'
+        for entry in $routes; do
+            [[ -n "$entry" ]] || continue
+            path="${entry%%=*}"; upstream="${entry#*=}"
+            locations+="    location ${path} {
+        proxy_pass ${upstream};
+        include ${PROXY_SNIPPET};${ws_line}
+    }
+
+"
+        done
+        IFS="$oldifs"
+    fi
+    locations+="    location / {
+        proxy_pass http://${BIND_ADDR}:${host_port};
+        include ${PROXY_SNIPPET};${ws_line}
+    }"
+
+    # TLS listener + hardening (only when a cert is provided).
+    local tls_listen=""
     if [[ -n "$cert" ]]; then
-        tls_lines="$(cat <<EOF
-    listen 443 ssl;
+        tls_listen="    listen 443 ssl;
     listen [::]:443 ssl;
     ssl_certificate     ${cert};
-    ssl_certificate_key ${cert_key};
-EOF
-)"
+    ssl_certificate_key ${cert_key};"
+        [[ -f "$SSL_OPTIONS_FILE" ]] && tls_listen+="
+    include ${SSL_OPTIONS_FILE};"
+        [[ -f "$SSL_DHPARAM_FILE" ]] && tls_listen+="
+    ssl_dhparam ${SSL_DHPARAM_FILE};"
     fi
 
-    # Include the WebSocket upgrade snippet only when this project opted in.
-    local ws_include=""
-    [[ "$ws" == "on" ]] && ws_include="        include ${PROXY_WS_SNIPPET};"
+    local header="# Managed by appctl — project: ${project}
+# Regenerate with: appctl add ${project} ${domain} [container_port]"
 
-    cat > "$conf" <<EOF
-# Managed by appctl — project: ${project}
-# Regenerate with: appctl add ${project} ${domain} [container_port]
+    if [[ -n "$cert" && "$force_https" == "on" ]]; then
+        cat > "$conf" <<EOF
+${header}
 server {
     listen 80;
     listen [::]:80;
-${tls_lines}
+    server_name ${domain};
+    return 301 https://\$host\$request_uri;
+}
+server {
+${tls_listen}
     server_name ${domain};
 
-    location / {
-        proxy_pass http://${BIND_ADDR}:${host_port};
-        include ${PROXY_SNIPPET};
-${ws_include}
-    }
+${locations}
 }
 EOF
+    elif [[ -n "$cert" ]]; then
+        cat > "$conf" <<EOF
+${header}
+server {
+    listen 80;
+    listen [::]:80;
+${tls_listen}
+    server_name ${domain};
+
+${locations}
+}
+EOF
+    else
+        cat > "$conf" <<EOF
+${header}
+server {
+    listen 80;
+    listen [::]:80;
+    server_name ${domain};
+
+${locations}
+}
+EOF
+    fi
     enable_site "$fname"
     printf '%s\n' "$conf"
 }
@@ -441,25 +547,34 @@ cmd_add() {
     bootstrap
     check_tls_assets "$tls_mode"
 
-    local host_port existing="" stored_cport="" stored_mode="" stored_ws=""
+    local host_port existing="" stored_cport="" stored_mode="" stored_ws="" stored_fhttps="" stored_routes=""
+    local force_https routes
     if existing="$(lookup_project "$project")"; then
         host_port="$(printf '%s' "$existing" | cut -f2)"
         stored_cport="$(printf '%s' "$existing" | cut -f3)"
         stored_mode="$(printf '%s' "$existing" | cut -f4)"
         stored_ws="$(printf '%s' "$existing" | cut -f5)"
+        stored_fhttps="$(printf '%s' "$existing" | cut -f6)"
+        stored_routes="$(printf '%s' "$existing" | cut -f7)"
         # A re-add keeps the recorded container port (and its port/tier) unless a
-        # new one is given.
+        # new one is given; likewise redirect/routes are kept unless the matching
+        # env var is explicitly set this run.
         (( explicit_port )) || container_port="${stored_cport:-$container_port}"
+        if [[ -n "${FORCE_HTTPS+x}" ]]; then force_https="$(onoff "$FORCE_HTTPS")"; else force_https="$stored_fhttps"; fi
+        if [[ -n "${ROUTES+x}" ]];      then routes="$ROUTES";                     else routes="$stored_routes"; fi
         info "Project '$project' already maps to host port ${host_port}; regenerating its config."
     else
+        force_https="$(onoff "${FORCE_HTTPS:-0}")"
+        routes="${ROUTES:-}"
         # Choose (prompt / env / default) then allocate from that tier's band.
         local tier; tier="$(prompt_tier)"
         resolve_tier_range "$tier" \
             || die "unknown tier '$tier' (available: $(tier_names)); configure PORT_TIERS"
         host_port="$(next_free_port "$RANGE_START" "$RANGE_END" "$tier")" || exit 1
-        write_registry_line "$project" "$domain" "$host_port" "$container_port" "$tls_mode" "$ws"
+        write_registry_line "$project" "$domain" "$host_port" "$container_port" "$tls_mode" "$ws" "$force_https" "$routes"
         info "Allocated host port ${host_port} (tier '$tier') -> '$project'."
     fi
+    validate_routes "$routes"
 
     # Resolve cert paths for the chosen mode.
     local cert cert_key
@@ -469,14 +584,15 @@ cmd_add() {
 
     if [[ "$tls_mode" == "certbot" ]]; then
         # Phase 1: HTTP-only block so certbot's http-01 challenge can be served.
-        write_server_block "$project" "$domain" "$host_port" "" "" "$ws" >/dev/null
+        # (No cert yet, so force_https is a no-op here — the challenge needs :80.)
+        write_server_block "$project" "$domain" "$host_port" "" "" "$ws" "off" "$routes" >/dev/null
         test_reload_or_rollback _rollback_add
 
         # Phase 2: obtain the cert. On failure keep the working HTTP route.
         if [[ -f "$cert" ]] || obtain_certbot_cert "$domain"; then
             # Phase 3: rewrite with :443. On test failure fall back to HTTP-only.
-            write_server_block "$project" "$domain" "$host_port" "$cert" "$cert_key" "$ws" >/dev/null
-            _rollback_https() { write_server_block "$project" "$domain" "$host_port" "" "" "$ws" >/dev/null; }
+            write_server_block "$project" "$domain" "$host_port" "$cert" "$cert_key" "$ws" "$force_https" "$routes" >/dev/null
+            _rollback_https() { write_server_block "$project" "$domain" "$host_port" "" "" "$ws" "off" "$routes" >/dev/null; }
             test_reload_or_rollback _rollback_https
         else
             err "certbot failed to obtain a cert for ${domain} — leaving the HTTP-only route up."
@@ -485,20 +601,22 @@ cmd_add() {
         fi
     else
         # shared / none: single-phase write with the resolved cert paths.
-        write_server_block "$project" "$domain" "$host_port" "$cert" "$cert_key" "$ws" >/dev/null
+        write_server_block "$project" "$domain" "$host_port" "$cert" "$cert_key" "$ws" "$force_https" "$routes" >/dev/null
         test_reload_or_rollback _rollback_add
     fi
 
     # Persist changed fields for an existing project. Done only after a
     # successful test+reload, so a failure can never leave a dangling row.
     if [[ -n "$existing" ]] && \
-       { [[ "$container_port" != "$stored_cport" ]] || [[ "$tls_mode" != "$stored_mode" ]] || [[ "$ws" != "$stored_ws" ]]; }; then
+       { [[ "$container_port" != "$stored_cport" ]] || [[ "$tls_mode" != "$stored_mode" ]] || \
+         [[ "$ws" != "$stored_ws" ]] || [[ "$force_https" != "$stored_fhttps" ]] || [[ "$routes" != "$stored_routes" ]]; }; then
         remove_registry_line "$project"
-        write_registry_line "$project" "$domain" "$host_port" "$container_port" "$tls_mode" "$ws"
+        write_registry_line "$project" "$domain" "$host_port" "$container_port" "$tls_mode" "$ws" "$force_https" "$routes"
     fi
 
     local scheme; scheme="$( [[ -n "$cert" ]] && echo https || echo http )"
-    info "Reloaded nginx: ${scheme}://${domain} -> ${BIND_ADDR}:${host_port} (tls=${tls_mode}, ws=${ws})"
+    local extras=""; [[ "$force_https" == "on" ]] && extras+=", force-https"; [[ -n "$routes" ]] && extras+=", +routes"
+    info "Reloaded nginx: ${scheme}://${domain} -> ${BIND_ADDR}:${host_port} (tls=${tls_mode}, ws=${ws}${extras})"
     print_compose_snippet "$project" "$host_port" "$container_port"
 }
 
@@ -528,13 +646,16 @@ cmd_list() {
         info "No apps registered yet."
         return 0
     fi
-    printf '%-24s %-30s %-10s %-15s %-10s %-8s %s\n' \
-        "PROJECT" "DOMAIN" "HOST_PORT" "CONTAINER_PORT" "TIER" "TLS" "WS"
+    printf '%-24s %-30s %-10s %-15s %-10s %-8s %-4s %s\n' \
+        "PROJECT" "DOMAIN" "HOST_PORT" "CONTAINER_PORT" "TIER" "TLS" "WS" "NOTES"
     registry_rows | sort -t$'\t' -k3 -n | \
-        while IFS=$'\t' read -r project domain host_port cport mode ws; do
-            printf '%-24s %-30s %-10s %-15s %-10s %-8s %s\n' \
+        while IFS=$'\t' read -r project domain host_port cport mode ws fhttps routes; do
+            local notes=""
+            [[ "$fhttps" == "on" ]] && notes+="→https "
+            [[ -n "$routes" ]]      && notes+="+routes"
+            printf '%-24s %-30s %-10s %-15s %-10s %-8s %-4s %s\n' \
                 "$project" "$domain" "$host_port" "$cport" \
-                "$(tier_for_port "$host_port")" "${mode:-$TLS_MODE}" "${ws:-on}"
+                "$(tier_for_port "$host_port")" "${mode:-$TLS_MODE}" "${ws:-on}" "$notes"
         done
 }
 
@@ -556,13 +677,15 @@ cmd_ws() {
     require_root
     bootstrap
 
-    local row domain host_port container_port tls_mode ws
+    local row domain host_port container_port tls_mode ws fhttps routes
     row="$(lookup_project "$project")" || die "project '$project' is not in the registry."
     domain="$(printf '%s' "$row" | cut -f1)"
     host_port="$(printf '%s' "$row" | cut -f2)"
     container_port="$(printf '%s' "$row" | cut -f3)"
     tls_mode="$(printf '%s' "$row" | cut -f4)"
     ws="$(printf '%s' "$row" | cut -f5)"
+    fhttps="$(printf '%s' "$row" | cut -f6)"
+    routes="$(printf '%s' "$row" | cut -f7)"
 
     if [[ "$ws" == "$want" ]]; then
         info "WebSocket upgrade already '${want}' for '${project}'. Nothing to do."
@@ -575,13 +698,13 @@ cmd_ws() {
     # we don't emit a :443 block pointing at a missing file.
     [[ -n "$cert" && ! -f "$cert" ]] && { cert=""; cert_key=""; }
 
-    write_server_block "$project" "$domain" "$host_port" "$cert" "$cert_key" "$want" >/dev/null
+    write_server_block "$project" "$domain" "$host_port" "$cert" "$cert_key" "$want" "$fhttps" "$routes" >/dev/null
 
-    _rollback_ws() { write_server_block "$project" "$domain" "$host_port" "$cert" "$cert_key" "$ws" >/dev/null; }
+    _rollback_ws() { write_server_block "$project" "$domain" "$host_port" "$cert" "$cert_key" "$ws" "$fhttps" "$routes" >/dev/null; }
     test_reload_or_rollback _rollback_ws
 
     remove_registry_line "$project"
-    write_registry_line "$project" "$domain" "$host_port" "$container_port" "$tls_mode" "$want"
+    write_registry_line "$project" "$domain" "$host_port" "$container_port" "$tls_mode" "$want" "$fhttps" "$routes"
     info "WebSocket upgrade set to '${want}' for '${project}'. nginx reloaded."
 }
 
@@ -620,18 +743,22 @@ cmd_docs() {
         if [[ -z "$(registry_rows)" ]]; then
             printf '_No apps registered yet._\n'
         else
-            printf '| Project | Domain | URL | Tier | Host Port | Container Port | Container | Status |\n'
-            printf '| ------- | ------ | --- | ---- | --------- | -------------- | --------- | ------ |\n'
-            registry_rows | sort -t$'\t' -k3 -n | while IFS=$'\t' read -r project domain host_port cport mode ws; do
+            printf '| Project | Domain | URL | Tier | Host Port | Container Port | Container | Status | Extras |\n'
+            printf '| ------- | ------ | --- | ---- | --------- | -------------- | --------- | ------ | ------ |\n'
+            registry_rows | sort -t$'\t' -k3 -n | while IFS=$'\t' read -r project domain host_port cport mode ws fhttps routes; do
                 mode="${mode:-$TLS_MODE}"
-                local scheme name status dockinfo tier
+                local scheme name status dockinfo tier extras
                 scheme="$(scheme_for "$mode")"
                 tier="$(tier_for_port "$host_port")"
                 dockinfo="$(_docker_for_port "$host_port")"
                 name="$(printf '%s' "$dockinfo" | cut -f1)"
                 status="$(printf '%s' "$dockinfo" | cut -f2)"
-                printf '| %s | %s | %s://%s | %s | %s | %s | %s | %s |\n' \
-                    "$project" "$domain" "$scheme" "$domain" "$tier" "$host_port" "$cport" "$name" "$status"
+                extras=""
+                [[ "${ws:-on}" == "on" ]] && extras+="ws "
+                [[ "$fhttps" == "on" ]]   && extras+="force-https "
+                [[ -n "$routes" ]]        && extras+="routes(${routes//|/, })"
+                printf '| %s | %s | %s://%s | %s | %s | %s | %s | %s | %s |\n' \
+                    "$project" "$domain" "$scheme" "$domain" "$tier" "$host_port" "$cport" "$name" "$status" "${extras:- }"
             done
         fi
     )"
@@ -693,7 +820,11 @@ Environment overrides (defaults shown):
   CERTBOT_CMD="${CERTBOT_CMD}"  CERTBOT_EMAIL="${CERTBOT_EMAIL}"
   SSL_CERT=${SSL_CERT}          (shared mode)
   SSL_CERT_KEY=${SSL_CERT_KEY}  (shared mode)
+  SSL_OPTIONS_FILE=${SSL_OPTIONS_FILE}   (included in :443 if present)
+  SSL_DHPARAM_FILE=${SSL_DHPARAM_FILE}      (included in :443 if present)
   ENABLE_WS=${ENABLE_WS}  (1 = new projects upgrade to WebSocket, 0 = off)
+  FORCE_HTTPS=1           (per-project: emit a :80 -> :443 301 redirect)
+  ROUTES='/api/=http://127.0.0.1:4000/'   (per-project: extra path upstreams)
   PROXY_TIMEOUT=${PROXY_TIMEOUT}  CLIENT_MAX_BODY_SIZE=${CLIENT_MAX_BODY_SIZE}
 
 Example:
@@ -701,6 +832,9 @@ Example:
   sudo appctl add blog.mutaqorrobin.online 3000     # or pass the container port
   sudo TIER=backend appctl add api.mutaqorrobin.online 8080   # allocate 11000-11999
   sudo TLS_MODE=shared appctl add api.mutaqorrobin.online     # use the shared cert
+  # front one domain with a frontend + a /api backend, forcing https:
+  sudo FORCE_HTTPS=1 ROUTES='/api/=http://127.0.0.1:4000/' \\
+      appctl add book-review.mutaqorrobin.online 3000
   appctl next backend                               # peek the next backend port
 EOF
 }
