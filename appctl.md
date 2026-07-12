@@ -377,22 +377,35 @@ sudo appctl ws api.mutaqorrobin.online off    # plain HTTP proxying
 
 ### `docs [output_file]`
 
-Print a **Markdown handover report** of everything appctl manages — domain, URL,
-host port, forwarded container port, container name, and status — by joining the
-registry with `docker ps`. Perfect for handing over "what's running where" to a
-colleague. Prints to stdout; also writes the file when you pass a path.
+Print a **Markdown handover report** of everything appctl manages — an overview
+table (linked domain, tier, `host → container` port, container name + status,
+TLS) plus a per-app configuration section (redirect, routes, upload limits, extra
+directives) — by joining the registry with `docker ps`. Perfect for handing over
+"what's running where" to a colleague. Prints to stdout; also writes the file when
+you pass a path.
 
 ```bash
 appctl docs                    # print to the terminal
 appctl docs handover.md        # also save a file to commit / share
 ```
 
-```
-| Project | Domain | URL | Host Port | Container Port | Container | Status |
-| ------- | ------ | --- | --------- | -------------- | --------- | ------ |
-| blog.mutaqorrobin.online | blog.mutaqorrobin.online | https://blog.mutaqorrobin.online | 10000 | 8080 | blog-app | Up 2 hours |
-| api.mutaqorrobin.online  | api.mutaqorrobin.online  | https://api.mutaqorrobin.online  | 10001 | 8080 | api-app  | Up 5 hours |
-```
+````markdown
+# appctl — running applications
+
+_Generated 2026-01-01 12:00:00 UTC · 2 app(s)._
+
+## Applications
+
+| Domain | Tier | Port (host → container) | Container | Status | TLS |
+| --- | --- | --- | --- | --- | --- |
+| [blog.mutaqorrobin.online](https://blog.mutaqorrobin.online) | frontend | 10000 → 8080 | blog-app | Up 2 hours (healthy) | certbot · https |
+| [api.mutaqorrobin.online](https://api.mutaqorrobin.online) | backend | 11000 → 8080 | api-app | Up 5 hours | certbot · https |
+
+## Per-app configuration
+
+- **blog.mutaqorrobin.online** — HTTP→HTTPS redirect
+- **api.mutaqorrobin.online** — HTTP→HTTPS redirect; upload limit 200M
+````
 
 ### `list` (alias: `ls`)
 

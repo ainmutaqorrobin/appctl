@@ -314,6 +314,13 @@ write_registry_line() {
 # Space-separated list of the configured tier names (for error messages).
 tier_names() { local e; for e in $PORT_TIERS; do printf '%s ' "${e%%:*}"; done; }
 
+# Human-readable tier bands, e.g. "frontend 10000-10999, backend 11000-11999".
+tiers_pretty() {
+    local e out=""
+    for e in $PORT_TIERS; do out+="${out:+, }${e%%:*} ${e#*:}"; done
+    printf '%s' "$out"
+}
+
 # Validate PORT_TIERS: each entry well-formed, start<=end, and no two overlap
 # (overlap would let two tiers hand out the same port). Dies on any problem.
 validate_tiers() {
@@ -795,37 +802,53 @@ cmd_docs() {
 
     local generated; generated="$(date '+%Y-%m-%d %H:%M:%S %Z' 2>/dev/null || echo 'unknown')"
 
+    local n; n="$(registry_rows | wc -l | tr -d ' ')"
+
     # Build the report into a variable so we can both print and (optionally) save.
     local report; report="$(
-        printf '# Running applications (appctl handover)\n\n'
-        printf '_Generated: %s_\n\n' "$generated"
-        printf 'Host nginx fronts these Docker apps. Each app publishes on %s:<host_port>;\n' "$BIND_ADDR"
-        printf 'nginx proxies to it and terminates TLS. Ports are allocated per tier: %s.\n\n' "$PORT_TIERS"
+        printf '# appctl — running applications\n\n'
+        printf '_Generated %s · %s app(s)._\n\n' "$generated" "$n"
+        printf 'Host nginx fronts these Docker apps. Each container publishes on `%s:<host_port>`\n' "$BIND_ADDR"
+        printf '(loopback only) and nginx proxies to it, terminating TLS. WebSocket upgrade is on\n'
+        printf 'by default. Port tiers: %s.\n' "$(tiers_pretty)"
 
         if [[ -z "$(registry_rows)" ]]; then
-            printf '_No apps registered yet._\n'
-        else
-            printf '| Project | Domain | URL | Tier | Host Port | Container Port | Container | Status | Extras |\n'
-            printf '| ------- | ------ | --- | ---- | --------- | -------------- | --------- | ------ | ------ |\n'
-            registry_rows | sort -t$'\t' -k3 -n | awk 'BEGIN{FS="\t";OFS="\037"}{$1=$1;print}' | \
-              while IFS=$'\037' read -r project domain host_port cport mode ws fhttps routes mbody pextra; do
-                mode="${mode:-$TLS_MODE}"
-                local scheme name status dockinfo tier extras
-                scheme="$(scheme_for "$mode")"
-                tier="$(tier_for_port "$host_port")"
-                dockinfo="$(_docker_for_port "$host_port")"
-                name="$(printf '%s' "$dockinfo" | cut -f1)"
-                status="$(printf '%s' "$dockinfo" | cut -f2)"
-                extras=""
-                [[ "${ws:-on}" == "on" ]] && extras+="ws "
-                [[ "$fhttps" == "on" ]]   && extras+="force-https "
-                [[ -n "$routes" ]]        && extras+="routes(${routes//|/, }) "
-                [[ -n "$mbody" ]]         && extras+="body=${mbody} "
-                [[ -n "$pextra" ]]        && extras+="extra(${pextra})"
-                printf '| %s | %s | %s://%s | %s | %s | %s | %s | %s | %s |\n' \
-                    "$project" "$domain" "$scheme" "$domain" "$tier" "$host_port" "$cport" "$name" "$status" "${extras:- }"
-            done
+            printf '\n_No apps registered yet._\n'
+            exit 0
         fi
+
+        # --- Overview table: one row per app, no redundant columns ---
+        printf '\n## Applications\n\n'
+        printf '| Domain | Tier | Port (host → container) | Container | Status | TLS |\n'
+        printf '| --- | --- | --- | --- | --- | --- |\n'
+        registry_rows | sort -t$'\t' -k3 -n | awk 'BEGIN{FS="\t";OFS="\037"}{$1=$1;print}' | \
+          while IFS=$'\037' read -r project domain host_port cport mode ws fhttps routes mbody pextra; do
+            mode="${mode:-$TLS_MODE}"
+            local scheme tier dockinfo name status
+            scheme="$(scheme_for "$mode")"
+            tier="$(tier_for_port "$host_port")"
+            dockinfo="$(_docker_for_port "$host_port")"
+            name="$(printf '%s' "$dockinfo" | cut -f1)"
+            status="$(printf '%s' "$dockinfo" | cut -f2)"
+            printf '| [%s](%s://%s) | %s | %s → %s | %s | %s | %s · %s |\n' \
+                "$domain" "$scheme" "$domain" "$tier" "$host_port" "$cport" "$name" "$status" "$mode" "$scheme"
+          done
+
+        # --- Per-app configuration: the details too long for a table cell ---
+        printf '\n## Per-app configuration\n\n'
+        registry_rows | sort -t$'\t' -k3 -n | awk 'BEGIN{FS="\t";OFS="\037"}{$1=$1;print}' | \
+          while IFS=$'\037' read -r project domain host_port cport mode ws fhttps routes mbody pextra; do
+            local -a parts=(); local rd label cfg p
+            [[ "$fhttps" == "on" ]] && parts+=("HTTP→HTTPS redirect")
+            if [[ -n "$routes" ]]; then rd="${routes//|/, }"; rd="${rd//=/ → }"; parts+=("routes: ${rd}"); fi
+            [[ -n "$mbody" ]] && parts+=("upload limit ${mbody}")
+            [[ -n "$pextra" ]] && parts+=("extra: \`${pextra}\`")
+            [[ "${ws:-on}" != "on" ]] && parts+=("WebSocket disabled")
+            cfg=""; for p in "${parts[@]}"; do cfg+="${cfg:+; }${p}"; done
+            [[ -n "$cfg" ]] || cfg="standard proxy settings"
+            label="$domain"; [[ "$project" != "$domain" ]] && label="${domain} (project ${project})"
+            printf '%s\n' "- **${label}** — ${cfg}"
+          done
     )"
 
     printf '%s\n' "$report"
