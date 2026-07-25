@@ -51,19 +51,18 @@ cert / reload dance for each project, and keeping every TLS block identical.
 
 ## Install
 
-**One-liner** (latest release):
+**One-liner** (always the latest release):
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/ainmutaqorrobin/appctl/v1.0.0/appctl \
+curl -fsSL https://github.com/ainmutaqorrobin/appctl/releases/latest/download/appctl \
   | sudo tee /usr/local/bin/appctl >/dev/null && sudo chmod +x /usr/local/bin/appctl
 appctl version
 ```
 
-Prefer to read before you run (recommended for anything you `sudo`)? Download,
-review, then install:
+Prefer to read before you `sudo`? Download, review, then install:
 
 ```bash
-curl -fsSLO https://raw.githubusercontent.com/ainmutaqorrobin/appctl/v1.0.0/appctl
+curl -fsSLO https://github.com/ainmutaqorrobin/appctl/releases/latest/download/appctl
 less appctl                                   # inspect it
 sudo install -m 755 appctl /usr/local/bin/appctl
 ```
