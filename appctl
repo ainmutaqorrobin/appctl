@@ -42,7 +42,7 @@
 
 set -euo pipefail
 
-APPCTL_VERSION="1.0.0"
+APPCTL_VERSION="1.0.1"
 APPCTL_REPO="ainmutaqorrobin/appctl"   # GitHub repo, used by `appctl upgrade`
 
 # ---- Configuration (override via environment) -------------------------------
