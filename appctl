@@ -42,6 +42,8 @@
 
 set -euo pipefail
 
+APPCTL_VERSION="1.0.0"
+
 # ---- Configuration (override via environment) -------------------------------
 : "${APP_REGISTRY:=/etc/nginx-deploy/registry.tsv}"        # source of truth
 : "${NGINX_SITES_AVAILABLE:=/etc/nginx/sites-available}"   # real server-block files
@@ -860,7 +862,7 @@ cmd_docs() {
 
 usage() {
     cat <<EOF
-appctl — port assigner + nginx server-block generator for host nginx + Docker
+appctl ${APPCTL_VERSION} — port assigner + nginx server-block generator for host nginx + Docker
 
 Commands:
   add <domain> [container_port]
@@ -891,6 +893,7 @@ Commands:
   next [tier]
         Print the next free port in a tier's band without allocating it
         (default tier: ${DEFAULT_TIER}).
+  version   Print the appctl version (${APPCTL_VERSION}).
 
 Environment overrides (defaults shown):
   APP_REGISTRY=${APP_REGISTRY}
@@ -939,6 +942,7 @@ main() {
         next)       cmd_next "$@" ;;
         ws)         cmd_ws "$@" ;;
         docs|report) cmd_docs "$@" ;;
+        version|--version|-V) printf 'appctl %s\n' "$APPCTL_VERSION" ;;
         ""|-h|--help|help) usage ;;
         *) die "unknown command '$cmd' (try: add, remove, list, next, ws, docs)" ;;
     esac

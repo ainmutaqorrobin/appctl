@@ -51,14 +51,34 @@ cert / reload dance for each project, and keeping every TLS block identical.
 
 ## Install
 
+**One-liner** (latest release):
+
 ```bash
-sudo cp appctl /usr/local/bin/appctl
-sudo chmod +x /usr/local/bin/appctl
+curl -fsSL https://raw.githubusercontent.com/ainmutaqorrobin/appctl/v1.0.0/appctl \
+  | sudo tee /usr/local/bin/appctl >/dev/null && sudo chmod +x /usr/local/bin/appctl
+appctl version
+```
+
+Prefer to read before you run (recommended for anything you `sudo`)? Download,
+review, then install:
+
+```bash
+curl -fsSLO https://raw.githubusercontent.com/ainmutaqorrobin/appctl/v1.0.0/appctl
+less appctl                                   # inspect it
+sudo install -m 755 appctl /usr/local/bin/appctl
+```
+
+Or clone and copy:
+
+```bash
+git clone https://github.com/ainmutaqorrobin/appctl && cd appctl
+sudo install -m 755 appctl /usr/local/bin/appctl
 appctl --help
 ```
 
-The first command bootstraps everything it needs (registry, shared proxy
-snippets, WebSocket map).
+The first `add` bootstraps everything appctl needs (registry, shared proxy
+snippets, WebSocket map). Read-only commands (`list`/`next`/`docs`) don't need
+root; `add`/`remove`/`ws` write nginx config and reload, so they use `sudo`.
 
 **Prerequisites:** nginx (`sites-available`/`sites-enabled` layout), Docker +
 Compose, and — for the default TLS mode — certbot
