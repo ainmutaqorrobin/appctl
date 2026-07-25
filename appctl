@@ -43,6 +43,7 @@
 set -euo pipefail
 
 APPCTL_VERSION="1.0.0"
+APPCTL_REPO="ainmutaqorrobin/appctl"   # GitHub repo, used by `appctl upgrade`
 
 # ---- Configuration (override via environment) -------------------------------
 : "${APP_REGISTRY:=/etc/nginx-deploy/registry.tsv}"        # source of truth
@@ -860,6 +861,60 @@ cmd_docs() {
     fi
 }
 
+# ---- upgrade: replace the installed appctl with a GitHub release ------------
+# Downloads the latest (or a given X.Y.Z) release asset, verifies it's a real
+# appctl, then installs it over the current binary. Needs write access to that
+# binary (usually root) — but not the nginx bootstrap, so it never touches config.
+cmd_upgrade() {
+    local want="${1:-latest}" url base="https://github.com/${APPCTL_REPO}/releases"
+    case "$want" in
+        latest)   url="${base}/latest/download/appctl" ;;
+        v[0-9]*)  url="${base}/download/${want}/appctl" ;;
+        [0-9]*)   url="${base}/download/v${want}/appctl" ;;
+        *) die "usage: appctl upgrade [latest|X.Y.Z]" ;;
+    esac
+
+    # Resolve the binary we're replacing (override with APPCTL_BIN).
+    local target="${APPCTL_BIN:-}"
+    if [[ -z "$target" ]]; then
+        target="$(command -v appctl 2>/dev/null || true)"
+        [[ -n "$target" ]] || target="/usr/local/bin/appctl"
+    fi
+    target="$(readlink -f "$target" 2>/dev/null || printf '%s' "$target")"
+
+    # We must be able to write the file (and its dir, for the atomic replace).
+    local dir; dir="$(dirname "$target")"
+    if [[ ! -w "$dir" || ( -e "$target" && ! -w "$target" ) ]]; then
+        [[ "${EUID:-$(id -u)}" -eq 0 ]] \
+            || die "cannot write ${target} — re-run with: sudo appctl upgrade${1:+ $1}"
+    fi
+
+    # Download to a temp file; clean it up on exit (null-safe: the trap fires in
+    # global scope after this function's local $tmp is gone).
+    local tmp; tmp="$(mktemp)"; trap 'rm -f "${tmp:-}"' EXIT
+    info "Downloading appctl (${want}) from GitHub…"
+    if command -v curl >/dev/null 2>&1; then
+        curl -fSL -o "$tmp" "$url" || die "download failed (${url}) — does that release exist?"
+    elif command -v wget >/dev/null 2>&1; then
+        wget -qO "$tmp" "$url"     || die "download failed (${url}) — does that release exist?"
+    else
+        die "need curl or wget to upgrade"
+    fi
+
+    # Verify it's actually appctl before overwriting the live binary.
+    head -n1 "$tmp" | grep -q '^#!/usr/bin/env bash' \
+        || die "downloaded file isn't a bash script (an error page?) — not installing"
+    local newver; newver="$(sed -n 's/^APPCTL_VERSION="\(.*\)"/\1/p' "$tmp")"
+    [[ -n "$newver" ]] || die "downloaded file has no APPCTL_VERSION — not installing"
+    bash -n "$tmp"     || die "downloaded file failed a syntax check — not installing"
+
+    if [[ "$newver" == "$APPCTL_VERSION" ]]; then
+        info "Already on ${APPCTL_VERSION}; reinstalling the same version."
+    fi
+    install -m 755 "$tmp" "$target" || die "failed to write ${target}"
+    info "Upgraded appctl ${APPCTL_VERSION} -> ${newver}  (${target})"
+}
+
 usage() {
     cat <<EOF
 appctl ${APPCTL_VERSION} — port assigner + nginx server-block generator for host nginx + Docker
@@ -893,6 +948,10 @@ Commands:
   next [tier]
         Print the next free port in a tier's band without allocating it
         (default tier: ${DEFAULT_TIER}).
+  upgrade [version]
+        Self-update: download the latest appctl release (or a given X.Y.Z) from
+        GitHub, verify it, and install it over the current binary. Needs write
+        access to the binary (usually 'sudo appctl upgrade').
   version   Print the appctl version (${APPCTL_VERSION}).
 
 Environment overrides (defaults shown):
@@ -942,9 +1001,10 @@ main() {
         next)       cmd_next "$@" ;;
         ws)         cmd_ws "$@" ;;
         docs|report) cmd_docs "$@" ;;
+        upgrade|self-update) cmd_upgrade "$@" ;;
         version|--version|-V) printf 'appctl %s\n' "$APPCTL_VERSION" ;;
         ""|-h|--help|help) usage ;;
-        *) die "unknown command '$cmd' (try: add, remove, list, next, ws, docs)" ;;
+        *) die "unknown command '$cmd' (try: add, remove, list, next, ws, docs, upgrade)" ;;
     esac
 }
 

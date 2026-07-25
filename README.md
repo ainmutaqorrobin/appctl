@@ -86,18 +86,25 @@ the host and port 80 reachable.
 
 ### Updating
 
-appctl is a single self-contained script, so updating is just re-running the
-installer — it overwrites the binary in place, and your registry, nginx blocks,
-and running apps are untouched:
+appctl can update itself — it downloads the latest release, verifies it, and
+installs it over the current binary (your registry, nginx blocks, and running
+apps are untouched):
+
+```bash
+sudo appctl upgrade            # -> latest release
+sudo appctl upgrade 1.2.3      # -> a specific version
+appctl version                 # confirm
+```
+
+Prefer to do it by hand? The same one-liner used to install also updates (it just
+overwrites the binary):
 
 ```bash
 curl -fsSL https://github.com/ainmutaqorrobin/appctl/releases/latest/download/appctl \
   | sudo tee /usr/local/bin/appctl >/dev/null && sudo chmod +x /usr/local/bin/appctl
-appctl version
 ```
 
-To pin a specific version instead of the latest, swap `latest/download` for
-`download/v1.2.3` in the URL. See all versions on the
+See all versions on the
 [releases page](https://github.com/ainmutaqorrobin/appctl/releases).
 
 ### Uninstall

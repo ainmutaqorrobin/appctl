@@ -155,9 +155,10 @@ appctl version   # -> appctl 1.0.0
 appctl --help
 ```
 
-**Updating** later is the same one-liner (it overwrites the binary in place; your
-registry and nginx config are untouched). See the
-[README](README.md#updating) for pinning a version and uninstalling.
+**Updating** later: `sudo appctl upgrade` (self-update to the latest release, or
+`sudo appctl upgrade X.Y.Z` for a specific one) — it verifies the download before
+replacing the binary, and your registry and nginx config are untouched. See the
+[README](README.md#updating) for the manual one-liner and uninstalling.
 
 The first time you run an `add`, `appctl` **bootstraps itself** — it creates the
 registry, a shared proxy-headers snippet, a WebSocket-upgrade snippet, and a
