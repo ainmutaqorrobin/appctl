@@ -1,0 +1,28 @@
+name: release
+
+# Any pushed tag like v1.0.0 publishes a GitHub release with the appctl script
+# attached as the 'appctl' asset (so releases/latest/download/appctl resolves to
+# it) and auto-generated notes from the commits since the previous tag.
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write   # required to create the release
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # full history so release notes can diff from the last tag
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" appctl \
+            --title "appctl ${GITHUB_REF_NAME}" \
+            --generate-notes

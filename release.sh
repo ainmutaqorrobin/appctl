@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# release.sh — tag + publish an appctl release in one command.
+# release.sh — bump the version and push a release tag in one command.
 #
 # Usage:
 #   ./release.sh                # release the current APPCTL_VERSION as-is
@@ -10,12 +10,12 @@
 #   ./release.sh 1.2.3          # set an explicit version, then release
 #
 # What it does: (optionally bump APPCTL_VERSION in ./appctl) -> commit any pending
-# changes -> create + push an annotated vX.Y.Z tag -> create a GitHub release with
-# the appctl script attached and auto-generated notes. The install URL
-# (releases/latest/download/appctl) then serves the new version automatically —
-# nothing else to edit.
+# changes -> create + push an annotated vX.Y.Z tag. Pushing the tag triggers the
+# GitHub Actions workflow (.github/workflows/release.yml), which publishes the
+# GitHub release with the appctl script attached and auto-generated notes. The
+# install URL (releases/latest/download/appctl) then serves the new version.
 #
-# Requires: git, and gh (GitHub CLI) authenticated (`gh auth login`).
+# Requires: git only. The release itself is created by CI — no local gh needed.
 
 set -euo pipefail
 cd "$(dirname "$0")"
@@ -23,9 +23,7 @@ cd "$(dirname "$0")"
 SCRIPT="appctl"
 REPO="ainmutaqorrobin/appctl"
 
-[[ -f "$SCRIPT" ]]            || { echo "error: $SCRIPT not found (run from the repo root)" >&2; exit 1; }
-command -v gh  >/dev/null     || { echo "error: gh (GitHub CLI) is required — https://cli.github.com" >&2; exit 1; }
-gh auth status >/dev/null 2>&1 || { echo "error: gh is not authenticated — run 'gh auth login'" >&2; exit 1; }
+[[ -f "$SCRIPT" ]] || { echo "error: $SCRIPT not found (run from the repo root)" >&2; exit 1; }
 
 # Current version from the script.
 cur="$(sed -n 's/^APPCTL_VERSION="\(.*\)"/\1/p' "$SCRIPT")"
@@ -60,14 +58,15 @@ if ! git diff --quiet || ! git diff --cached --quiet; then
     git commit -m "chore(release): ${tag}"
 fi
 
-# Tag, push, publish. The appctl script is attached as the 'appctl' asset, which
-# is what releases/latest/download/appctl resolves to.
+# Tag + push. Pushing the tag triggers the release workflow, which creates the
+# GitHub release and attaches the appctl script as the 'appctl' asset (what
+# releases/latest/download/appctl resolves to).
 branch="$(git rev-parse --abbrev-ref HEAD)"
 git tag -a "${tag}" -m "appctl ${tag}"
 git push origin "${branch}"
 git push origin "${tag}"
-gh release create "${tag}" "$SCRIPT" --repo "$REPO" --title "appctl ${tag}" --generate-notes
 
 echo
-echo "✔ Published ${tag}"
-echo "  Install: curl -fsSL https://github.com/${REPO}/releases/latest/download/appctl | sudo tee /usr/local/bin/appctl >/dev/null && sudo chmod +x /usr/local/bin/appctl"
+echo "✔ Pushed ${tag} — GitHub Actions is now publishing the release."
+echo "  Watch:   https://github.com/${REPO}/actions"
+echo "  Release: https://github.com/${REPO}/releases/tag/${tag}"
