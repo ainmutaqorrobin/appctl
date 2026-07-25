@@ -84,6 +84,32 @@ Compose, and — for the default TLS mode — certbot
 (`sudo apt install certbot python3-certbot-nginx`) with the app's DNS pointed at
 the host and port 80 reachable.
 
+### Updating
+
+appctl is a single self-contained script, so updating is just re-running the
+installer — it overwrites the binary in place, and your registry, nginx blocks,
+and running apps are untouched:
+
+```bash
+curl -fsSL https://github.com/ainmutaqorrobin/appctl/releases/latest/download/appctl \
+  | sudo tee /usr/local/bin/appctl >/dev/null && sudo chmod +x /usr/local/bin/appctl
+appctl version
+```
+
+To pin a specific version instead of the latest, swap `latest/download` for
+`download/v1.2.3` in the URL. See all versions on the
+[releases page](https://github.com/ainmutaqorrobin/appctl/releases).
+
+### Uninstall
+
+```bash
+sudo rm /usr/local/bin/appctl
+```
+
+This removes only the CLI. Your generated nginx blocks and the registry stay put —
+if you want a clean slate, tear each project down first with
+`sudo appctl remove <domain>` (then stop its container), before removing the binary.
+
 ## Quick start
 
 ```bash
@@ -130,6 +156,40 @@ See **[appctl.md](appctl.md)** for the complete deployment guide: the model,
 prerequisites, per-command reference, TLS setup (certbot and shared cert),
 WebSocket details, migrating hand-written blocks, configuration, and
 troubleshooting.
+
+## Releasing (maintainers)
+
+Cutting a release is one command — no manual tagging, no GitHub UI, no local
+`gh`:
+
+```bash
+./release.sh patch     # 1.0.0 → 1.0.1   (bug fix)
+./release.sh minor     # 1.0.0 → 1.1.0   (new feature)
+./release.sh major     # 1.0.0 → 2.0.0   (breaking change)
+./release.sh 1.4.2     # or an explicit version
+./release.sh           # release the current version as-is (e.g. the first release)
+```
+
+It bumps `APPCTL_VERSION` in `appctl`, commits any pending changes as
+`chore(release): vX.Y.Z`, and pushes an annotated `vX.Y.Z` tag. Pushing that tag
+triggers [`.github/workflows/release.yml`](.github/workflows/release.yml), which
+publishes the GitHub release with the `appctl` script attached and release notes
+auto-generated from the commits since the last tag. Because the install URL points
+at `releases/latest/download/appctl`, users get the new version with no doc changes.
+
+Typical update flow:
+
+```bash
+# 1. make your fix/feature in ./appctl
+# 2. (optional) sanity-check it
+bash -n appctl && shellcheck appctl
+# 3. ship it
+./release.sh patch
+# 4. watch the release job at github.com/ainmutaqorrobin/appctl/actions
+```
+
+`release.sh` refuses to reuse an existing tag, so you can't double-publish. Only
+`git` is required locally — the release itself is built by CI.
 
 ## License
 

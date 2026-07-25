@@ -141,19 +141,23 @@ only way in" and "every app port is silently internet-facing." Keep the
 
 ## Installation
 
-Copy the script (`appctl` in this repo) onto your `PATH` and make it
-executable:
+Install the latest release with one command:
 
 ```bash
-sudo cp appctl /usr/local/bin/appctl
-sudo chmod +x /usr/local/bin/appctl
+curl -fsSL https://github.com/ainmutaqorrobin/appctl/releases/latest/download/appctl \
+  | sudo tee /usr/local/bin/appctl >/dev/null && sudo chmod +x /usr/local/bin/appctl
 ```
 
-Verify it's installed:
+(Or clone the repo and `sudo install -m 755 appctl /usr/local/bin/appctl`.) Verify:
 
 ```bash
+appctl version   # -> appctl 1.0.0
 appctl --help
 ```
+
+**Updating** later is the same one-liner (it overwrites the binary in place; your
+registry and nginx config are untouched). See the
+[README](README.md#updating) for pinning a version and uninstalling.
 
 The first time you run an `add`, `appctl` **bootstraps itself** — it creates the
 registry, a shared proxy-headers snippet, a WebSocket-upgrade snippet, and a
